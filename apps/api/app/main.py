@@ -1,4 +1,5 @@
 import logging
+import time
 
 from fastapi import Depends, FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +46,19 @@ def metrics():
 
 @app.get("/todos", response_model=list[TodoRead])
 def list_todos(db: Session = Depends(get_db)) -> list[Todo]:
+    if settings.todo_read_delay_seconds > 0:
+        logger.warning(
+            "todo latency injection active",
+            extra={
+                "event": "latency_injection",
+                "extra_fields": {
+                    "path": "/todos",
+                    "delay_seconds": settings.todo_read_delay_seconds,
+                },
+            },
+        )
+        time.sleep(settings.todo_read_delay_seconds)
+
     todos = db.query(Todo).order_by(Todo.id.desc()).all()
     logger.info(
         "todos listed",
@@ -52,6 +66,7 @@ def list_todos(db: Session = Depends(get_db)) -> list[Todo]:
             "event": "list_todos",
             "extra_fields": {
                 "todo_count": len(todos),
+                "delay_seconds": settings.todo_read_delay_seconds,
             },
         },
     )

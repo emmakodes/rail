@@ -7,6 +7,7 @@ class Settings:
         "DATABASE_URL",
         "postgresql+psycopg://postgres:postgres@db:5432/todos",
     )
+    todo_read_delay_seconds = float(os.getenv("TODO_READ_DELAY_SECONDS", "0"))
     cors_origins = os.getenv(
         "CORS_ORIGINS",
         "http://localhost:3000,http://127.0.0.1:3000",

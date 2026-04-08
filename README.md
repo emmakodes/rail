@@ -57,13 +57,14 @@ Create three Railway services:
 
 Useful env vars:
 
-- API: `DATABASE_URL`, `CORS_ORIGINS`
+- API: `DATABASE_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`
 - Web: `NEXT_PUBLIC_API_BASE_URL`
 
 Recommended Railway values:
 
 - `DATABASE_URL`: use Railway Postgres `DATABASE_URL`
 - `CORS_ORIGINS`: `https://<your-web-domain>`
+- `TODO_READ_DELAY_SECONDS`: `0` normally, `2` for the latency drill
 - `NEXT_PUBLIC_API_BASE_URL`: `https://<your-api-domain>`
 
 Railway config files:
@@ -85,3 +86,25 @@ Useful first checks:
 curl http://localhost:8000/health
 curl http://localhost:8000/metrics
 ```
+
+## Production Battlefield Scenario 01
+
+Symptom:
+
+- `GET /todos` slows to multiple seconds under concurrent load
+
+Injection:
+
+- set `TODO_READ_DELAY_SECONDS=2` on the API service
+- redeploy the API
+- run:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> load-tests/todos-read-latency.js
+```
+
+What to observe:
+
+- Railway logs will show `event=latency_injection`
+- `/metrics` will show `todo_http_request_duration_seconds` moving into higher buckets for `/todos`
+- browser requests will feel slow even though CPU may look normal
