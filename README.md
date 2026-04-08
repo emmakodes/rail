@@ -10,6 +10,8 @@ The backend exposes only two product endpoints:
 
 - `GET /todos`
 - `POST /todos`
+- `GET /health`
+- `GET /metrics`
 
 Todos are stored in PostgreSQL.
 
@@ -68,3 +70,18 @@ Railway config files:
 
 - `apps/api/railway.json`
 - `apps/web/railway.json`
+
+## Observability baseline
+
+The API now includes:
+
+- structured JSON logs
+- `x-request-id` response header
+- Prometheus metrics at `GET /metrics`
+
+Useful first checks:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/metrics
+```
