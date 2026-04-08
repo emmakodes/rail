@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 
 const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  (process.env.NODE_ENV === "development" ? "http://localhost:8000" : "");
 
 export default function TodoApp() {
   const [title, setTitle] = useState("");
@@ -13,6 +14,12 @@ export default function TodoApp() {
   const [error, setError] = useState("");
 
   async function loadTodos() {
+    if (!API_BASE_URL) {
+      setError("Missing NEXT_PUBLIC_API_BASE_URL for this deployment.");
+      setLoading(false);
+      return;
+    }
+
     try {
       setLoading(true);
       setError("");
@@ -38,6 +45,11 @@ export default function TodoApp() {
   async function handleSubmit(event) {
     event.preventDefault();
     if (!title.trim()) {
+      return;
+    }
+
+    if (!API_BASE_URL) {
+      setError("Missing NEXT_PUBLIC_API_BASE_URL for this deployment.");
       return;
     }
 
