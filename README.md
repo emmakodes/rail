@@ -147,24 +147,24 @@ PYTHONPATH=. python scripts/seed_todos.py --count 100000
 2. Trigger the bad query shape:
 
 ```bash
-curl "http://localhost:8000/todos?search=work&search_mode=contains"
+curl "http://localhost:8000/todos?search=work&search_mode=contains&limit=50&offset=0"
 ```
 
 3. Inspect the plan:
 
 ```bash
-curl "http://localhost:8000/todos/explain?search=work&search_mode=contains"
+curl "http://localhost:8000/todos/explain?search=work&search_mode=contains&limit=50&offset=0"
 ```
 
 4. Load test it:
 
 ```bash
-k6 run -e API_BASE_URL=https://<your-api-domain> -e SEARCH=work -e SEARCH_MODE=contains load-tests/todos-search-fullscan.js
+k6 run -e API_BASE_URL=https://<your-api-domain> -e SEARCH=work -e SEARCH_MODE=contains -e LIMIT=50 load-tests/todos-search-fullscan.js
 ```
 
 What to look for:
 
-- `Seq Scan` in `EXPLAIN ANALYZE`
+- `Seq Scan`, `Bitmap Index Scan`, or wide filtering in `EXPLAIN ANALYZE`
 - large `Rows Removed by Filter`
 - higher DB CPU and slower `/todos` search requests
 
@@ -173,3 +173,12 @@ Senior fix direction:
 - avoid `%term%` when you can
 - for exact search, use `search_mode=exact` plus an index on `title`
 - if you really need contains-search, use `pg_trgm` with a GIN index
+
+Scenario 02 fix now applied:
+
+- `/todos` is paginated with `limit` and `offset`
+- default `limit=50`, max `limit=100`
+- startup creates:
+  - `ix_todos_title`
+  - `pg_trgm` extension
+  - `ix_todos_title_trgm`

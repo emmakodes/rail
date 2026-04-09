@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session
 
 from app.cache import get_todo_list_cache, invalidate_todo_list_cache, set_todo_list_cache
 from app.config import settings
-from app.db import engine, get_db
-from app.models import Base, Todo
+from app.db import get_db, initialize_database
+from app.models import Todo
 from app.observability import configure_logging, metrics_response, record_request_metrics
 from app.schemas import TodoCreate, TodoRead
 
@@ -31,7 +31,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
-    Base.metadata.create_all(bind=engine)
+    initialize_database()
 
 
 @app.middleware("http")
@@ -53,9 +53,11 @@ def metrics():
 async def list_todos(
     search: str | None = Query(default=None, min_length=1, max_length=120),
     search_mode: str = Query(default="all", pattern="^(all|contains|exact)$"),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=5000),
     db: Session = Depends(get_db),
 ) -> list[Todo] | list[dict]:
-    use_cache = search is None and search_mode == "all"
+    use_cache = search is None and search_mode == "all" and offset == 0 and limit == 50
     cached_todos = get_todo_list_cache() if use_cache else None
     if cached_todos is not None:
         logger.info(
@@ -67,6 +69,8 @@ async def list_todos(
                     "cache_status": "hit",
                     "search_mode": search_mode,
                     "search": search,
+                    "limit": limit,
+                    "offset": offset,
                     "delay_seconds": settings.todo_read_delay_seconds,
                 },
             },
@@ -113,7 +117,7 @@ async def list_todos(
         elif search_mode == "exact":
             query = query.filter(Todo.title == search)
 
-    todos = query.all()
+    todos = query.offset(offset).limit(limit).all()
     payload = jsonable_encoder(todos)
     if use_cache:
         set_todo_list_cache(payload)
@@ -126,6 +130,8 @@ async def list_todos(
                 "cache_status": "miss" if use_cache else "bypass",
                 "search_mode": search_mode,
                 "search": search,
+                "limit": limit,
+                "offset": offset,
                 "delay_seconds": settings.todo_read_delay_seconds,
             },
         },
@@ -137,6 +143,8 @@ async def list_todos(
 def explain_todos_query(
     search: str = Query(..., min_length=1, max_length=120),
     search_mode: str = Query(default="contains", pattern="^(contains|exact)$"),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=5000),
     db: Session = Depends(get_db),
 ) -> dict[str, list[str]]:
     if search_mode == "contains":
@@ -147,9 +155,10 @@ def explain_todos_query(
             FROM todos
             WHERE title ILIKE :pattern
             ORDER BY id DESC
+            LIMIT :limit OFFSET :offset
             """
         )
-        params = {"pattern": f"%{search}%"}
+        params = {"pattern": f"%{search}%", "limit": limit, "offset": offset}
     else:
         statement = text(
             """
@@ -158,9 +167,10 @@ def explain_todos_query(
             FROM todos
             WHERE title = :title
             ORDER BY id DESC
+            LIMIT :limit OFFSET :offset
             """
         )
-        params = {"title": search}
+        params = {"title": search, "limit": limit, "offset": offset}
 
     rows = db.execute(statement, params).all()
     plan = [row[0] for row in rows]
@@ -171,6 +181,8 @@ def explain_todos_query(
             "extra_fields": {
                 "search_mode": search_mode,
                 "search": search,
+                "limit": limit,
+                "offset": offset,
             },
         },
     )
