@@ -3,9 +3,10 @@ import time
 import asyncio
 
 import httpx
-from fastapi import Depends, FastAPI, status
+from fastapi import Depends, FastAPI, Query, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.cache import get_todo_list_cache, invalidate_todo_list_cache, set_todo_list_cache
@@ -49,8 +50,13 @@ def metrics():
 
 
 @app.get("/todos", response_model=list[TodoRead])
-async def list_todos(db: Session = Depends(get_db)) -> list[Todo] | list[dict]:
-    cached_todos = get_todo_list_cache()
+async def list_todos(
+    search: str | None = Query(default=None, min_length=1, max_length=120),
+    search_mode: str = Query(default="all", pattern="^(all|contains|exact)$"),
+    db: Session = Depends(get_db),
+) -> list[Todo] | list[dict]:
+    use_cache = search is None and search_mode == "all"
+    cached_todos = get_todo_list_cache() if use_cache else None
     if cached_todos is not None:
         logger.info(
             "todos served from cache",
@@ -59,6 +65,8 @@ async def list_todos(db: Session = Depends(get_db)) -> list[Todo] | list[dict]:
                 "extra_fields": {
                     "todo_count": len(cached_todos),
                     "cache_status": "hit",
+                    "search_mode": search_mode,
+                    "search": search,
                     "delay_seconds": settings.todo_read_delay_seconds,
                 },
             },
@@ -98,21 +106,75 @@ async def list_todos(db: Session = Depends(get_db)) -> list[Todo] | list[dict]:
         )
         time.sleep(settings.todo_read_delay_seconds)
 
-    todos = db.query(Todo).order_by(Todo.id.desc()).all()
+    query = db.query(Todo).order_by(Todo.id.desc())
+    if search is not None:
+        if search_mode == "contains":
+            query = query.filter(Todo.title.ilike(f"%{search}%"))
+        elif search_mode == "exact":
+            query = query.filter(Todo.title == search)
+
+    todos = query.all()
     payload = jsonable_encoder(todos)
-    set_todo_list_cache(payload)
+    if use_cache:
+        set_todo_list_cache(payload)
     logger.info(
         "todos listed",
         extra={
             "event": "list_todos",
             "extra_fields": {
                 "todo_count": len(todos),
-                "cache_status": "miss",
+                "cache_status": "miss" if use_cache else "bypass",
+                "search_mode": search_mode,
+                "search": search,
                 "delay_seconds": settings.todo_read_delay_seconds,
             },
         },
     )
     return payload
+
+
+@app.get("/todos/explain", include_in_schema=False)
+def explain_todos_query(
+    search: str = Query(..., min_length=1, max_length=120),
+    search_mode: str = Query(default="contains", pattern="^(contains|exact)$"),
+    db: Session = Depends(get_db),
+) -> dict[str, list[str]]:
+    if search_mode == "contains":
+        statement = text(
+            """
+            EXPLAIN ANALYZE
+            SELECT id, title, created_at
+            FROM todos
+            WHERE title ILIKE :pattern
+            ORDER BY id DESC
+            """
+        )
+        params = {"pattern": f"%{search}%"}
+    else:
+        statement = text(
+            """
+            EXPLAIN ANALYZE
+            SELECT id, title, created_at
+            FROM todos
+            WHERE title = :title
+            ORDER BY id DESC
+            """
+        )
+        params = {"title": search}
+
+    rows = db.execute(statement, params).all()
+    plan = [row[0] for row in rows]
+    logger.info(
+        "todos explain analyzed",
+        extra={
+            "event": "explain_todos",
+            "extra_fields": {
+                "search_mode": search_mode,
+                "search": search,
+            },
+        },
+    )
+    return {"plan": plan}
 
 
 @app.post("/todos", response_model=TodoRead, status_code=status.HTTP_201_CREATED)
