@@ -57,14 +57,18 @@ Create three Railway services:
 
 Useful env vars:
 
-- API: `DATABASE_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`
+- API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`
 - Web: `NEXT_PUBLIC_API_BASE_URL`
 
 Recommended Railway values:
 
 - `DATABASE_URL`: use Railway Postgres `DATABASE_URL`
+- `REDIS_URL`: use Railway Redis `REDIS_URL` if you add Redis
 - `CORS_ORIGINS`: `https://<your-web-domain>`
 - `TODO_READ_DELAY_SECONDS`: `0` normally, `2` for the latency drill
+- `TODO_CACHE_TTL_SECONDS`: `30`
+- `TODO_UPSTREAM_URL`: optional slow dependency for timeout drills
+- `TODO_UPSTREAM_TIMEOUT_SECONDS`: `3`
 - `NEXT_PUBLIC_API_BASE_URL`: `https://<your-api-domain>`
 
 Railway config files:
@@ -108,3 +112,19 @@ What to observe:
 - Railway logs will show `event=latency_injection`
 - `/metrics` will show `todo_http_request_duration_seconds` moving into higher buckets for `/todos`
 - browser requests will feel slow even though CPU may look normal
+
+## Scenario 01 Fix Direction
+
+The first fix path is now implemented:
+
+- `GET /todos` checks Redis cache first
+- `POST /todos` invalidates the todo list cache
+- optional upstream calls can be protected with a timeout
+- `uvicorn.access` can now inherit the request ID because the middleware no longer resets it before access logging
+
+Recommended fix-mode settings:
+
+```text
+TODO_READ_DELAY_SECONDS=0
+TODO_CACHE_TTL_SECONDS=30
+```

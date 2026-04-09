@@ -7,7 +7,11 @@ class Settings:
         "DATABASE_URL",
         "postgresql+psycopg://postgres:postgres@db:5432/todos",
     )
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    todo_cache_ttl_seconds = int(os.getenv("TODO_CACHE_TTL_SECONDS", "30"))
     todo_read_delay_seconds = float(os.getenv("TODO_READ_DELAY_SECONDS", "0"))
+    todo_upstream_url = os.getenv("TODO_UPSTREAM_URL", "")
+    todo_upstream_timeout_seconds = float(os.getenv("TODO_UPSTREAM_TIMEOUT_SECONDS", "3"))
     cors_origins = os.getenv(
         "CORS_ORIGINS",
         "http://localhost:3000,http://127.0.0.1:3000",

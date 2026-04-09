@@ -72,7 +72,7 @@ def _route_template(request: Request) -> str:
 
 async def record_request_metrics(request: Request, call_next) -> Response:
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-    token = request_id_context.set(request_id)
+    request_id_context.set(request_id)
     started_at = time.perf_counter()
     logger = logging.getLogger("app.request")
     method = request.method
@@ -118,5 +118,4 @@ async def record_request_metrics(request: Request, call_next) -> Response:
             },
         },
     )
-    request_id_context.reset(token)
     return response

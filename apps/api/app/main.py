@@ -1,10 +1,14 @@
 import logging
 import time
+import asyncio
 
+import httpx
 from fastapi import Depends, FastAPI, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
+from app.cache import get_todo_list_cache, invalidate_todo_list_cache, set_todo_list_cache
 from app.config import settings
 from app.db import engine, get_db
 from app.models import Base, Todo
@@ -45,7 +49,42 @@ def metrics():
 
 
 @app.get("/todos", response_model=list[TodoRead])
-def list_todos(db: Session = Depends(get_db)) -> list[Todo]:
+async def list_todos(db: Session = Depends(get_db)) -> list[Todo] | list[dict]:
+    cached_todos = get_todo_list_cache()
+    if cached_todos is not None:
+        logger.info(
+            "todos served from cache",
+            extra={
+                "event": "list_todos",
+                "extra_fields": {
+                    "todo_count": len(cached_todos),
+                    "cache_status": "hit",
+                    "delay_seconds": settings.todo_read_delay_seconds,
+                },
+            },
+        )
+        return cached_todos
+
+    if settings.todo_upstream_url:
+        try:
+            async with httpx.AsyncClient() as client:
+                upstream_response = await asyncio.wait_for(
+                    client.get(settings.todo_upstream_url),
+                    timeout=settings.todo_upstream_timeout_seconds,
+                )
+            upstream_response.raise_for_status()
+        except (TimeoutError, httpx.HTTPError):
+            logger.warning(
+                "todo upstream timed out or failed",
+                extra={
+                    "event": "todo_upstream_timeout",
+                    "extra_fields": {
+                        "upstream_url": settings.todo_upstream_url,
+                        "timeout_seconds": settings.todo_upstream_timeout_seconds,
+                    },
+                },
+            )
+
     if settings.todo_read_delay_seconds > 0:
         logger.warning(
             "todo latency injection active",
@@ -60,17 +99,20 @@ def list_todos(db: Session = Depends(get_db)) -> list[Todo]:
         time.sleep(settings.todo_read_delay_seconds)
 
     todos = db.query(Todo).order_by(Todo.id.desc()).all()
+    payload = jsonable_encoder(todos)
+    set_todo_list_cache(payload)
     logger.info(
         "todos listed",
         extra={
             "event": "list_todos",
             "extra_fields": {
                 "todo_count": len(todos),
+                "cache_status": "miss",
                 "delay_seconds": settings.todo_read_delay_seconds,
             },
         },
     )
-    return todos
+    return payload
 
 
 @app.post("/todos", response_model=TodoRead, status_code=status.HTTP_201_CREATED)
@@ -79,6 +121,7 @@ def create_todo(payload: TodoCreate, db: Session = Depends(get_db)) -> Todo:
     db.add(todo)
     db.commit()
     db.refresh(todo)
+    invalidate_todo_list_cache()
     logger.info(
         "todo created",
         extra={
