@@ -11,6 +11,7 @@ from fastapi import Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 request_id_context: ContextVar[str] = ContextVar("request_id", default="-")
+db_query_count_context: ContextVar[int] = ContextVar("db_query_count", default=0)
 
 
 class JsonFormatter(logging.Formatter):
@@ -63,6 +64,18 @@ def metrics_response() -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+def reset_db_query_count() -> None:
+    db_query_count_context.set(0)
+
+
+def increment_db_query_count() -> None:
+    db_query_count_context.set(db_query_count_context.get() + 1)
+
+
+def current_db_query_count() -> int:
+    return db_query_count_context.get()
+
+
 def _route_template(request: Request) -> str:
     route = request.scope.get("route")
     if route is not None and getattr(route, "path", None):
@@ -73,6 +86,7 @@ def _route_template(request: Request) -> str:
 async def record_request_metrics(request: Request, call_next) -> Response:
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     request_id_context.set(request_id)
+    reset_db_query_count()
     started_at = time.perf_counter()
     logger = logging.getLogger("app.request")
     method = request.method
@@ -104,6 +118,7 @@ async def record_request_metrics(request: Request, call_next) -> Response:
     http_request_duration_seconds.labels(method=method, path=path).observe(elapsed)
     http_requests_total.labels(method=method, path=path, status_code=str(status_code)).inc()
     response.headers["x-request-id"] = request_id
+    response.headers["x-db-queries"] = str(current_db_query_count())
 
     logger.info(
         "request completed",
@@ -114,6 +129,7 @@ async def record_request_metrics(request: Request, call_next) -> Response:
                 "path": path,
                 "status_code": status_code,
                 "duration_ms": round(elapsed * 1000, 2),
+                "db_queries": current_db_query_count(),
                 "client_ip": request.client.host if request.client else None,
             },
         },

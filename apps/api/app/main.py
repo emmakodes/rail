@@ -7,14 +7,14 @@ from fastapi import Depends, FastAPI, Query, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.cache import get_todo_list_cache, invalidate_todo_list_cache, set_todo_list_cache
 from app.config import settings
 from app.db import get_db, initialize_database
 from app.models import Todo
 from app.observability import configure_logging, metrics_response, record_request_metrics
-from app.schemas import TodoCreate, TodoRead
+from app.schemas import TodoCreate, TodoRead, TodoWithTagsRead
 
 configure_logging()
 app = FastAPI(title=settings.app_name)
@@ -49,15 +49,23 @@ def metrics():
     return metrics_response()
 
 
-@app.get("/todos", response_model=list[TodoRead])
+@app.get("/todos", response_model=list[TodoRead] | list[TodoWithTagsRead])
 async def list_todos(
     search: str | None = Query(default=None, min_length=1, max_length=120),
     search_mode: str = Query(default="all", pattern="^(all|contains|exact)$"),
+    include_tags: bool = Query(default=False),
+    tag_load_strategy: str = Query(default="n_plus_one", pattern="^(n_plus_one|selectin)$"),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=5000),
     db: Session = Depends(get_db),
 ) -> list[Todo] | list[dict]:
-    use_cache = search is None and search_mode == "all" and offset == 0 and limit == 50
+    use_cache = (
+        search is None
+        and search_mode == "all"
+        and offset == 0
+        and limit == 50
+        and not include_tags
+    )
     cached_todos = get_todo_list_cache() if use_cache else None
     if cached_todos is not None:
         logger.info(
@@ -69,6 +77,8 @@ async def list_todos(
                     "cache_status": "hit",
                     "search_mode": search_mode,
                     "search": search,
+                    "include_tags": include_tags,
+                    "tag_load_strategy": tag_load_strategy,
                     "limit": limit,
                     "offset": offset,
                     "delay_seconds": settings.todo_read_delay_seconds,
@@ -117,8 +127,22 @@ async def list_todos(
         elif search_mode == "exact":
             query = query.filter(Todo.title == search)
 
+    if include_tags and tag_load_strategy == "selectin":
+        query = query.options(selectinload(Todo.tags))
+
     todos = query.offset(offset).limit(limit).all()
-    payload = jsonable_encoder(todos)
+    if include_tags:
+        payload = [
+            {
+                "id": todo.id,
+                "title": todo.title,
+                "created_at": todo.created_at,
+                "tags": [{"id": tag.id, "label": tag.label} for tag in todo.tags],
+            }
+            for todo in todos
+        ]
+    else:
+        payload = jsonable_encoder(todos)
     if use_cache:
         set_todo_list_cache(payload)
     logger.info(
@@ -130,6 +154,8 @@ async def list_todos(
                 "cache_status": "miss" if use_cache else "bypass",
                 "search_mode": search_mode,
                 "search": search,
+                "include_tags": include_tags,
+                "tag_load_strategy": tag_load_strategy,
                 "limit": limit,
                 "offset": offset,
                 "delay_seconds": settings.todo_read_delay_seconds,

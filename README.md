@@ -182,3 +182,46 @@ Scenario 02 fix now applied:
   - `ix_todos_title`
   - `pg_trgm` extension
   - `ix_todos_title_trgm`
+
+## Production Battlefield Scenario 03
+
+Symptom:
+
+- `GET /todos` looks fine with plain todos, then becomes slow when each todo causes its own follow-up tag query
+
+Injection:
+
+1. Seed tags for 200 todos:
+
+```bash
+cd apps/api
+PYTHONPATH=. python scripts/seed_todo_tags.py --limit 200 --tags-per-todo 4
+```
+
+2. Trigger the N+1 path:
+
+```bash
+curl -i "http://localhost:8000/todos?include_tags=true&tag_load_strategy=n_plus_one&limit=200&offset=0"
+```
+
+3. Look at the response headers:
+
+- `x-db-queries`
+
+4. Load test it:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e TAG_LOAD_STRATEGY=n_plus_one -e LIMIT=200 load-tests/todos-n-plus-one.js
+```
+
+What to observe:
+
+- `x-db-queries` climbs toward `1 + N`
+- latency increases even if each single query is individually fast
+- logs show `include_tags=true` and `tag_load_strategy=n_plus_one`
+
+Fix direction:
+
+- use `tag_load_strategy=selectin`
+- compare `x-db-queries` before and after
+- this is the concrete proof that eager loading fixed the N+1 pattern

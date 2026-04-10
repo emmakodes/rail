@@ -13,3 +13,14 @@ class TodoRead(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class TodoTagRead(BaseModel):
+    id: int
+    label: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TodoWithTagsRead(TodoRead):
+    tags: list[TodoTagRead] = []
