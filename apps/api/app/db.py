@@ -1,10 +1,9 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
-from app.observability import increment_db_query_count
 
 
 engine = create_engine(settings.normalized_database_url, pool_pre_ping=True)
@@ -19,11 +18,6 @@ INDEX_STATEMENTS = (
 )
 
 
-@event.listens_for(engine, "before_cursor_execute")
-def count_queries(*_args, **_kwargs) -> None:
-    increment_db_query_count()
-
-
 def initialize_database() -> None:
     from app.models import Base
 
@@ -35,6 +29,7 @@ def initialize_database() -> None:
 
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
+    db.info["query_count"] = 0
     try:
         yield db
     finally:

@@ -6,6 +6,7 @@ import httpx
 from fastapi import Depends, FastAPI, Query, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session, selectinload
 
@@ -51,6 +52,7 @@ def metrics():
 
 @app.get("/todos", response_model=list[TodoRead] | list[TodoWithTagsRead])
 async def list_todos(
+    request: Request,
     search: str | None = Query(default=None, min_length=1, max_length=120),
     search_mode: str = Query(default="all", pattern="^(all|contains|exact)$"),
     include_tags: bool = Query(default=False),
@@ -59,6 +61,10 @@ async def list_todos(
     offset: int = Query(default=0, ge=0, le=5000),
     db: Session = Depends(get_db),
 ) -> list[Todo] | list[dict]:
+    def count_query() -> None:
+        db.info["query_count"] = db.info.get("query_count", 0) + 1
+        request.state.db_query_count = db.info["query_count"]
+
     use_cache = (
         search is None
         and search_mode == "all"
@@ -130,17 +136,32 @@ async def list_todos(
     if include_tags and tag_load_strategy == "selectin":
         query = query.options(selectinload(Todo.tags))
 
+    count_query()
     todos = query.offset(offset).limit(limit).all()
     if include_tags:
-        payload = [
-            {
-                "id": todo.id,
-                "title": todo.title,
-                "created_at": todo.created_at,
-                "tags": [{"id": tag.id, "label": tag.label} for tag in todo.tags],
-            }
-            for todo in todos
-        ]
+        if tag_load_strategy == "n_plus_one":
+            payload = []
+            for todo in todos:
+                count_query()
+                payload.append(
+                    {
+                        "id": todo.id,
+                        "title": todo.title,
+                        "created_at": todo.created_at,
+                        "tags": [{"id": tag.id, "label": tag.label} for tag in todo.tags],
+                    }
+                )
+        else:
+            count_query()
+            payload = [
+                {
+                    "id": todo.id,
+                    "title": todo.title,
+                    "created_at": todo.created_at,
+                    "tags": [{"id": tag.id, "label": tag.label} for tag in todo.tags],
+                }
+                for todo in todos
+            ]
     else:
         payload = jsonable_encoder(todos)
     if use_cache:
@@ -167,12 +188,15 @@ async def list_todos(
 
 @app.get("/todos/explain", include_in_schema=False)
 def explain_todos_query(
+    request: Request,
     search: str = Query(..., min_length=1, max_length=120),
     search_mode: str = Query(default="contains", pattern="^(contains|exact)$"),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=5000),
     db: Session = Depends(get_db),
 ) -> dict[str, list[str]]:
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
     if search_mode == "contains":
         statement = text(
             """
@@ -217,6 +241,7 @@ def explain_todos_query(
 
 @app.post("/todos", response_model=TodoRead, status_code=status.HTTP_201_CREATED)
 def create_todo(payload: TodoCreate, db: Session = Depends(get_db)) -> Todo:
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
     todo = Todo(title=payload.title.strip())
     db.add(todo)
     db.commit()

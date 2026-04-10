@@ -12,7 +12,7 @@ TAGS = ["work", "urgent", "home", "admin"]
 
 
 def seed_tags(db: Session, limit: int, tags_per_todo: int) -> None:
-    todos = db.query(Todo).order_by(Todo.id.asc()).limit(limit).all()
+    todos = db.query(Todo).order_by(Todo.id.desc()).limit(limit).all()
     print(f"found {len(todos)} todos to tag")
 
     for todo in todos:
