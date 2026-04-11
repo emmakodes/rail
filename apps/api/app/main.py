@@ -1,6 +1,7 @@
 import logging
 import time
 import asyncio
+import json
 
 import httpx
 from fastapi import Depends, FastAPI, Query, status
@@ -15,7 +16,7 @@ from app.config import settings
 from app.db import get_db, initialize_database
 from app.models import Todo
 from app.observability import configure_logging, metrics_response, record_request_metrics
-from app.schemas import TodoCreate, TodoRead, TodoWithTagsRead
+from app.schemas import TodoCreate, TodoCursorPage, TodoRead, TodoWithTagsRead
 
 configure_logging()
 app = FastAPI(title=settings.app_name)
@@ -57,6 +58,7 @@ async def list_todos(
     search_mode: str = Query(default="all", pattern="^(all|contains|exact)$"),
     include_tags: bool = Query(default=False),
     tag_load_strategy: str = Query(default="n_plus_one", pattern="^(n_plus_one|selectin)$"),
+    disable_pagination: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=5000),
     db: Session = Depends(get_db),
@@ -71,6 +73,7 @@ async def list_todos(
         and offset == 0
         and limit == 50
         and not include_tags
+        and not disable_pagination
     )
     cached_todos = get_todo_list_cache() if use_cache else None
     if cached_todos is not None:
@@ -85,6 +88,7 @@ async def list_todos(
                     "search": search,
                     "include_tags": include_tags,
                     "tag_load_strategy": tag_load_strategy,
+                    "disable_pagination": disable_pagination,
                     "limit": limit,
                     "offset": offset,
                     "delay_seconds": settings.todo_read_delay_seconds,
@@ -137,7 +141,10 @@ async def list_todos(
         query = query.options(selectinload(Todo.tags))
 
     count_query()
-    todos = query.offset(offset).limit(limit).all()
+    if disable_pagination:
+        todos = query.all()
+    else:
+        todos = query.offset(offset).limit(limit).all()
     if include_tags:
         if tag_load_strategy == "n_plus_one":
             payload = []
@@ -164,6 +171,8 @@ async def list_todos(
             ]
     else:
         payload = jsonable_encoder(todos)
+
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
     if use_cache:
         set_todo_list_cache(payload)
     logger.info(
@@ -177,9 +186,53 @@ async def list_todos(
                 "search": search,
                 "include_tags": include_tags,
                 "tag_load_strategy": tag_load_strategy,
+                "disable_pagination": disable_pagination,
                 "limit": limit,
                 "offset": offset,
                 "delay_seconds": settings.todo_read_delay_seconds,
+                "response_bytes": request.state.response_bytes,
+            },
+        },
+    )
+    return payload
+
+
+@app.get("/todos/cursor", response_model=TodoCursorPage)
+def list_todos_cursor(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: int | None = Query(default=None, ge=1),
+    db: Session = Depends(get_db),
+) -> dict:
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+
+    query = db.query(Todo).order_by(Todo.id.desc())
+    if cursor is not None:
+        query = query.filter(Todo.id < cursor)
+
+    todos = query.limit(limit + 1).all()
+    has_more = len(todos) > limit
+    visible = todos[:limit]
+    next_cursor = visible[-1].id if has_more and visible else None
+
+    payload = {
+        "items": jsonable_encoder(visible),
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
+    logger.info(
+        "todos cursor listed",
+        extra={
+            "event": "list_todos_cursor",
+            "extra_fields": {
+                "todo_count": len(visible),
+                "limit": limit,
+                "cursor": cursor,
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+                "response_bytes": request.state.response_bytes,
             },
         },
     )

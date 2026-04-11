@@ -74,6 +74,7 @@ async def record_request_metrics(request: Request, call_next) -> Response:
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     request_id_context.set(request_id)
     request.state.db_query_count = 0
+    request.state.response_bytes = 0
     started_at = time.perf_counter()
     logger = logging.getLogger("app.request")
     method = request.method
@@ -106,6 +107,7 @@ async def record_request_metrics(request: Request, call_next) -> Response:
     http_requests_total.labels(method=method, path=path, status_code=str(status_code)).inc()
     response.headers["x-request-id"] = request_id
     response.headers["x-db-queries"] = str(getattr(request.state, "db_query_count", 0))
+    response.headers["x-response-bytes"] = str(getattr(request.state, "response_bytes", 0))
 
     logger.info(
         "request completed",
@@ -117,6 +119,7 @@ async def record_request_metrics(request: Request, call_next) -> Response:
                 "status_code": status_code,
                 "duration_ms": round(elapsed * 1000, 2),
                 "db_queries": getattr(request.state, "db_query_count", 0),
+                "response_bytes": getattr(request.state, "response_bytes", 0),
                 "client_ip": request.client.host if request.client else None,
             },
         },

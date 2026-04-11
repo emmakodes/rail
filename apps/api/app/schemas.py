@@ -24,3 +24,9 @@ class TodoTagRead(BaseModel):
 
 class TodoWithTagsRead(TodoRead):
     tags: list[TodoTagRead] = []
+
+
+class TodoCursorPage(BaseModel):
+    items: list[TodoRead]
+    next_cursor: int | None
+    has_more: bool

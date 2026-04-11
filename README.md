@@ -225,3 +225,53 @@ Fix direction:
 - use `tag_load_strategy=selectin`
 - compare `x-db-queries` before and after
 - this is the concrete proof that eager loading fixed the N+1 pattern
+
+## Production Battlefield Scenario 04
+
+Symptom:
+
+- `GET /todos` returns huge payloads and the frontend freezes when pagination is removed
+
+Injection:
+
+1. Trigger the unbounded response path:
+
+```bash
+curl -i "http://localhost:8000/todos?disable_pagination=true"
+```
+
+2. Observe:
+
+- `x-response-bytes`
+- response body size
+- Railway logs for `response_bytes`
+
+3. Load test the bad version:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e DISABLE_PAGINATION=true load-tests/todos-response-bloat.js
+```
+
+4. Compare with paginated version:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e DISABLE_PAGINATION=false -e LIMIT=50 load-tests/todos-response-bloat.js
+```
+
+5. Compare cursor pagination:
+
+```bash
+curl "http://localhost:8000/todos/cursor?limit=20"
+```
+
+What to observe:
+
+- `x-response-bytes` explodes when pagination is disabled
+- backend latency may look acceptable while payload size and client experience become terrible
+- cursor pagination keeps payload size flat and avoids deep offset scanning
+
+Fix direction:
+
+- keep pagination on by default
+- use cursor pagination for feed-like scrolling
+- track response size as a first-class signal, not only latency
