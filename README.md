@@ -57,7 +57,7 @@ Create three Railway services:
 
 Useful env vars:
 
-- API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`
+- API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`
 - Web: `NEXT_PUBLIC_API_BASE_URL`
 
 Recommended Railway values:
@@ -69,6 +69,9 @@ Recommended Railway values:
 - `TODO_CACHE_TTL_SECONDS`: `30`
 - `TODO_UPSTREAM_URL`: optional slow dependency for timeout drills
 - `TODO_UPSTREAM_TIMEOUT_SECONDS`: `3`
+- `DB_POOL_SIZE`: `5` normally, `3` for the pool exhaustion drill
+- `DB_MAX_OVERFLOW`: `10` normally, `0` for the pool exhaustion drill
+- `DB_POOL_TIMEOUT_SECONDS`: `30` normally, `1` to surface pool timeout quickly
 - `NEXT_PUBLIC_API_BASE_URL`: `https://<your-api-domain>`
 
 Railway config files:
@@ -275,3 +278,56 @@ Fix direction:
 - keep pagination on by default
 - use cursor pagination for feed-like scrolling
 - track response size as a first-class signal, not only latency
+
+## Production Battlefield Scenario 05
+
+Symptom:
+
+- requests fail with `Cannot acquire connection from pool` even though PostgreSQL itself is mostly idle
+
+Injection:
+
+1. Set a tiny pool on the API service:
+
+```text
+DB_POOL_SIZE=3
+DB_MAX_OVERFLOW=0
+DB_POOL_TIMEOUT_SECONDS=1
+```
+
+2. Redeploy the API.
+
+3. Check pool status:
+
+```bash
+curl "http://localhost:8000/pool/status"
+```
+
+4. Run the connection-hold path with concurrent load:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e HOLD_SECONDS=5 -e VUS=10 -e DURATION=20s load-tests/todos-pool-exhaustion.js
+```
+
+5. Inspect pool and database activity:
+
+```bash
+curl "http://localhost:8000/pool/status"
+curl "http://localhost:8000/pool/pg-stat-activity"
+```
+
+What to observe:
+
+- only 3 requests can hold DB connections at once
+- extra requests start failing with `503` and `Cannot acquire connection from pool`
+- `/pool/status` shows the pool as fully checked out
+- `pg_stat_activity` shows a small number of sessions occupied, not a busy database
+
+What this drill teaches:
+
+- pool exhaustion is about connection availability, not necessarily database CPU
+- a request can exhaust the pool simply by holding a connection too long
+- the fix is usually:
+  - always close sessions with `finally`
+  - keep external I/O outside the DB connection window
+  - size and timeout the pool deliberately

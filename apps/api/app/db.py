@@ -6,7 +6,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import settings
 
 
-engine = create_engine(settings.normalized_database_url, pool_pre_ping=True)
+engine = create_engine(
+    settings.normalized_database_url,
+    pool_pre_ping=True,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_timeout=settings.db_pool_timeout_seconds,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
@@ -34,3 +40,16 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def pool_snapshot() -> dict[str, str | int | float]:
+    checked_out = getattr(engine.pool, "checkedout", lambda: 0)()
+    overflow = getattr(engine.pool, "overflow", lambda: 0)()
+    return {
+        "status": engine.pool.status(),
+        "pool_size": settings.db_pool_size,
+        "max_overflow": settings.db_max_overflow,
+        "pool_timeout_seconds": settings.db_pool_timeout_seconds,
+        "checked_out": checked_out,
+        "overflow": overflow,
+    }

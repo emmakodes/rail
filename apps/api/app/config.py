@@ -12,6 +12,9 @@ class Settings:
     todo_read_delay_seconds = float(os.getenv("TODO_READ_DELAY_SECONDS", "0"))
     todo_upstream_url = os.getenv("TODO_UPSTREAM_URL", "")
     todo_upstream_timeout_seconds = float(os.getenv("TODO_UPSTREAM_TIMEOUT_SECONDS", "3"))
+    db_pool_size = int(os.getenv("DB_POOL_SIZE", "5"))
+    db_max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+    db_pool_timeout_seconds = float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "30"))
     cors_origins = os.getenv(
         "CORS_ORIGINS",
         "http://localhost:3000,http://127.0.0.1:3000",

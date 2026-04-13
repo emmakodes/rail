@@ -1,19 +1,20 @@
-import logging
-import time
 import asyncio
 import json
+import logging
+import time
 
 import httpx
-from fastapi import Depends, FastAPI, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request
 from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, selectinload
 
 from app.cache import get_todo_list_cache, invalidate_todo_list_cache, set_todo_list_cache
 from app.config import settings
-from app.db import get_db, initialize_database
+from app.db import engine, get_db, initialize_database, pool_snapshot
 from app.models import Todo
 from app.observability import configure_logging, metrics_response, record_request_metrics
 from app.schemas import TodoCreate, TodoCursorPage, TodoRead, TodoWithTagsRead
@@ -49,6 +50,83 @@ def healthcheck() -> dict[str, str]:
 @app.get("/metrics", include_in_schema=False)
 def metrics():
     return metrics_response()
+
+
+@app.get("/pool/status")
+def get_pool_status() -> dict[str, str | int | float]:
+    return pool_snapshot()
+
+
+@app.get("/pool/pg-stat-activity")
+def get_pg_stat_activity(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, list[dict[str, str | int | None]]]:
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+    rows = db.execute(
+        text(
+            """
+            SELECT
+              state,
+              wait_event_type,
+              COUNT(*)::int AS connection_count
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+            GROUP BY state, wait_event_type
+            ORDER BY connection_count DESC, state NULLS LAST
+            """
+        )
+    ).mappings().all()
+    payload = {"connections": [dict(row) for row in rows]}
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
+    return payload
+
+
+@app.get("/pool/exhaust")
+def exhaust_pool(
+    request: Request,
+    hold_seconds: int = Query(default=5, ge=1, le=30),
+    db: Session = Depends(get_db),
+) -> dict[str, str | int | float]:
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+    started_at = time.perf_counter()
+    try:
+        # Force checkout, then keep the connection occupied with a DB-side sleep.
+        db.execute(text("SELECT pg_sleep(:hold_seconds)"), {"hold_seconds": hold_seconds})
+    except SATimeoutError as exc:
+        logger.warning(
+            "pool checkout timed out",
+            extra={
+                "event": "pool_exhaustion",
+                "extra_fields": {
+                    "hold_seconds": hold_seconds,
+                    **pool_snapshot(),
+                },
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cannot acquire connection from pool",
+        ) from exc
+
+    elapsed = round(time.perf_counter() - started_at, 2)
+    payload = {
+        "status": "ok",
+        "hold_seconds": hold_seconds,
+        "elapsed_seconds": elapsed,
+        **pool_snapshot(),
+    }
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
+    logger.info(
+        "pool drill completed",
+        extra={
+            "event": "pool_exhaustion",
+            "extra_fields": payload,
+        },
+    )
+    return payload
 
 
 @app.get("/todos", response_model=list[TodoRead] | list[TodoWithTagsRead])
