@@ -331,3 +331,24 @@ What this drill teaches:
   - always close sessions with `finally`
   - keep external I/O outside the DB connection window
   - size and timeout the pool deliberately
+
+Fix comparison:
+
+1. Hit the fixed path once:
+
+```bash
+curl "http://localhost:8000/pool/exhaust-fixed?wait_seconds=5"
+```
+
+2. Run the same 10-user load against the fixed path:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e PATH=/pool/exhaust-fixed -e HOLD_SECONDS=5 -e VUS=10 -e DURATION=20s load-tests/todos-pool-exhaustion.js
+```
+
+What should change:
+
+- the requests still take about 5 seconds overall
+- but they should stop failing from pool exhaustion
+- `/pool/status` should no longer stay pinned at all connections checked out
+- this proves the issue was connection hold time, not just total request time

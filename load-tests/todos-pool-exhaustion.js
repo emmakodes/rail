@@ -3,6 +3,7 @@ import { check, sleep } from "k6";
 
 const baseUrl = __ENV.API_BASE_URL || "http://localhost:8000";
 const holdSeconds = __ENV.HOLD_SECONDS || "5";
+const path = __ENV.PATH || "/pool/exhaust";
 
 export const options = {
   vus: Number(__ENV.VUS || 10),
@@ -11,7 +12,7 @@ export const options = {
 
 export default function () {
   const response = http.get(
-    `${baseUrl}/pool/exhaust?hold_seconds=${encodeURIComponent(holdSeconds)}`,
+    `${baseUrl}${path}?hold_seconds=${encodeURIComponent(holdSeconds)}&wait_seconds=${encodeURIComponent(holdSeconds)}`,
   );
 
   check(response, {

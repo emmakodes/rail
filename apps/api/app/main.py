@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.cache import get_todo_list_cache, invalidate_todo_list_cache, set_todo_list_cache
 from app.config import settings
-from app.db import engine, get_db, initialize_database, pool_snapshot
+from app.db import SessionLocal, engine, get_db, initialize_database, pool_snapshot
 from app.models import Todo
 from app.observability import configure_logging, metrics_response, record_request_metrics
 from app.schemas import TodoCreate, TodoCursorPage, TodoRead, TodoWithTagsRead
@@ -123,6 +123,58 @@ def exhaust_pool(
         "pool drill completed",
         extra={
             "event": "pool_exhaustion",
+            "extra_fields": payload,
+        },
+    )
+    return payload
+
+
+@app.get("/pool/exhaust-fixed")
+def exhaust_pool_fixed(
+    request: Request,
+    wait_seconds: int = Query(default=5, ge=1, le=30),
+) -> dict[str, str | int | float]:
+    started_at = time.perf_counter()
+
+    # Simulate slow non-DB work first. No DB session is opened yet.
+    time.sleep(wait_seconds)
+
+    db = SessionLocal()
+    db.info["query_count"] = 0
+    try:
+        db.info["query_count"] += 1
+        request.state.db_query_count = db.info["query_count"]
+        db.execute(text("SELECT 1"))
+    except SATimeoutError as exc:
+        logger.warning(
+            "pool checkout timed out on fixed path",
+            extra={
+                "event": "pool_exhaustion_fixed",
+                "extra_fields": {
+                    "wait_seconds": wait_seconds,
+                    **pool_snapshot(),
+                },
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cannot acquire connection from pool",
+        ) from exc
+    finally:
+        db.close()
+
+    elapsed = round(time.perf_counter() - started_at, 2)
+    payload = {
+        "status": "ok",
+        "wait_seconds": wait_seconds,
+        "elapsed_seconds": elapsed,
+        **pool_snapshot(),
+    }
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
+    logger.info(
+        "pool drill fixed path completed",
+        extra={
+            "event": "pool_exhaustion_fixed",
             "extra_fields": payload,
         },
     )
