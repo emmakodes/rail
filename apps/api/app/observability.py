@@ -5,6 +5,7 @@ import logging
 import sys
 import time
 import uuid
+import asyncio
 from fastapi import Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
@@ -57,10 +58,41 @@ http_request_duration_seconds = Histogram(
     ("method", "path"),
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
 )
+event_loop_lag_seconds = Histogram(
+    "todo_event_loop_lag_seconds",
+    "Observed event loop lag in seconds.",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
 
 
 def metrics_response() -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+async def monitor_event_loop_lag(
+    *,
+    interval_seconds: float = 0.1,
+    warning_threshold_ms: float = 250,
+) -> None:
+    logger = logging.getLogger("app.event_loop")
+    while True:
+        started_at = time.perf_counter()
+        await asyncio.sleep(interval_seconds)
+        elapsed = time.perf_counter() - started_at
+        lag = max(elapsed - interval_seconds, 0)
+        event_loop_lag_seconds.observe(lag)
+        lag_ms = round(lag * 1000, 2)
+        if lag_ms >= warning_threshold_ms:
+            logger.warning(
+                "event loop lag detected",
+                extra={
+                    "event": "event_loop_lag",
+                    "extra_fields": {
+                        "lag_ms": lag_ms,
+                        "interval_ms": round(interval_seconds * 1000, 2),
+                    },
+                },
+            )
 
 
 def _route_template(request: Request) -> str:

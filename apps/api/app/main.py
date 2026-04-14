@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+from functools import partial
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -16,7 +17,12 @@ from app.cache import get_todo_list_cache, invalidate_todo_list_cache, set_todo_
 from app.config import settings
 from app.db import SessionLocal, engine, get_db, initialize_database, pool_snapshot
 from app.models import Todo
-from app.observability import configure_logging, metrics_response, record_request_metrics
+from app.observability import (
+    configure_logging,
+    metrics_response,
+    monitor_event_loop_lag,
+    record_request_metrics,
+)
 from app.schemas import TodoCreate, TodoCursorPage, TodoRead, TodoWithTagsRead
 
 configure_logging()
@@ -33,8 +39,9 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
     initialize_database()
+    asyncio.create_task(monitor_event_loop_lag())
 
 
 @app.middleware("http")
@@ -50,6 +57,29 @@ def healthcheck() -> dict[str, str]:
 @app.get("/metrics", include_in_schema=False)
 def metrics():
     return metrics_response()
+
+
+@app.get("/loop/fast")
+async def loop_fast() -> dict[str, str]:
+    await asyncio.sleep(0.01)
+    return {"status": "ok"}
+
+
+@app.get("/loop/blocking")
+async def loop_blocking(
+    block_seconds: float = Query(default=1.0, ge=0.1, le=10.0),
+) -> dict[str, float | str]:
+    time.sleep(block_seconds)
+    return {"status": "ok", "block_seconds": block_seconds}
+
+
+@app.get("/loop/blocking-fixed")
+async def loop_blocking_fixed(
+    block_seconds: float = Query(default=1.0, ge=0.1, le=10.0),
+) -> dict[str, float | str]:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, partial(time.sleep, block_seconds))
+    return {"status": "ok", "block_seconds": block_seconds}
 
 
 @app.get("/pool/status")

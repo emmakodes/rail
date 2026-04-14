@@ -352,3 +352,54 @@ What should change:
 - but they should stop failing from pool exhaustion
 - `/pool/status` should no longer stay pinned at all connections checked out
 - this proves the issue was connection hold time, not just total request time
+
+## Production Battlefield Scenario 06
+
+Symptom:
+
+- one slow async endpoint causes unrelated fast endpoints to become slow too
+
+Injection:
+
+1. Hit the intentionally broken async endpoint:
+
+```bash
+curl "http://localhost:8000/loop/blocking?block_seconds=1"
+```
+
+This endpoint is declared `async`, but it uses `time.sleep(1)`, which blocks the event loop.
+
+2. Compare with the fast endpoint:
+
+```bash
+curl "http://localhost:8000/loop/fast"
+```
+
+3. Run the mixed load test:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e BLOCKING_PATH=/loop/blocking -e BLOCK_SECONDS=1 -e BLOCKING_VUS=5 -e FAST_VUS=5 -e DURATION=20s load-tests/todos-event-loop-blocking.js
+```
+
+What to observe:
+
+- `GET /loop/fast` slows down even though it contains no blocking work
+- Railway logs show `event=event_loop_lag`
+- `/metrics` will show latency moving up on both endpoints, not just the blocking one
+
+Fix direction:
+
+- move blocking sync work off the event loop
+- use `run_in_executor` for truly sync work that has no async equivalent
+
+Fixed comparison:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e BLOCKING_PATH=/loop/blocking-fixed -e BLOCK_SECONDS=1 -e BLOCKING_VUS=5 -e FAST_VUS=5 -e DURATION=20s load-tests/todos-event-loop-blocking.js
+```
+
+What should change:
+
+- the blocking endpoint still takes about 1 second
+- but `GET /loop/fast` should stay much faster
+- event loop lag warnings should drop sharply
