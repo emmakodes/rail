@@ -58,6 +58,7 @@ Create three Railway services:
 Useful env vars:
 
 - API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`
+- API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_CACHE_TTL_JITTER_SECONDS`, `TODO_CACHE_LOCK_TIMEOUT_SECONDS`, `TODO_CACHE_LOCK_WAIT_TIMEOUT_SECONDS`, `TODO_CACHE_LOCK_POLL_SECONDS`, `TODO_CACHE_REBUILD_DELAY_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`
 - Web: `NEXT_PUBLIC_API_BASE_URL`
 
 Recommended Railway values:
@@ -67,6 +68,11 @@ Recommended Railway values:
 - `CORS_ORIGINS`: `https://<your-web-domain>`
 - `TODO_READ_DELAY_SECONDS`: `0` normally, `2` for the latency drill
 - `TODO_CACHE_TTL_SECONDS`: `30`
+- `TODO_CACHE_TTL_JITTER_SECONDS`: `0` normally, `5` for jittered expiry
+- `TODO_CACHE_LOCK_TIMEOUT_SECONDS`: `5`
+- `TODO_CACHE_LOCK_WAIT_TIMEOUT_SECONDS`: `6`
+- `TODO_CACHE_LOCK_POLL_SECONDS`: `0.05`
+- `TODO_CACHE_REBUILD_DELAY_SECONDS`: `0` normally, `1` for cache stampede drills
 - `TODO_UPSTREAM_URL`: optional slow dependency for timeout drills
 - `TODO_UPSTREAM_TIMEOUT_SECONDS`: `3`
 - `DB_POOL_SIZE`: `5` normally, `3` for the pool exhaustion drill
@@ -403,3 +409,67 @@ What should change:
 - the blocking endpoint still takes about 1 second
 - but `GET /loop/fast` should stay much faster
 - event loop lag warnings should drop sharply
+
+## Production Battlefield Scenario 07
+
+Symptom:
+
+- after a cache wipe or Redis restart, many requests miss at once and all hammer the database
+
+Injection:
+
+1. Set API env vars:
+
+```text
+TODO_CACHE_TTL_SECONDS=10
+TODO_CACHE_TTL_JITTER_SECONDS=0
+TODO_CACHE_REBUILD_DELAY_SECONDS=1
+```
+
+2. Prime and inspect the cache:
+
+```bash
+curl "http://localhost:8000/todos?cache_strategy=plain"
+curl "http://localhost:8000/cache/todos/status"
+```
+
+3. Simulate the Redis restart / hot-key wipe:
+
+```bash
+curl "http://localhost:8000/cache/todos/reset"
+```
+
+4. Hammer the hot key:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e CACHE_STRATEGY=plain -e VUS=200 -e DURATION=5s load-tests/todos-cache-stampede.js
+```
+
+What to observe:
+
+- many requests show `x-cache-status: miss`
+- latency jumps because every request rebuilds the same key
+- logs show many `cache_status=miss` lines clustered together
+
+Fix direction:
+
+- `jitter`: use randomized TTLs so expiries do not line up in normal operation
+- `lock`: allow only one request to rebuild the hot key while others wait for the cache to be filled
+
+Hot-key fix comparison:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e CACHE_STRATEGY=lock -e VUS=200 -e DURATION=5s load-tests/todos-cache-stampede.js
+```
+
+What should change:
+
+- only one request should rebuild the cache
+- the others should show `x-cache-status: lock_wait_hit` or `lock_wait`
+- latency and DB pressure should drop sharply compared with `plain`
+
+Jitter baseline:
+
+- set `TODO_CACHE_TTL_JITTER_SECONDS=5`
+- use `cache_strategy=jitter`
+- this does not fix a full Redis restart on a single hot key, but it prevents synchronized TTL expiries during normal operation

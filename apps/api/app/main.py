@@ -13,7 +13,15 @@ from sqlalchemy import text
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, selectinload
 
-from app.cache import get_todo_list_cache, invalidate_todo_list_cache, set_todo_list_cache
+from app.cache import (
+    acquire_todo_list_cache_lock,
+    get_todo_list_cache,
+    get_todo_list_cache_ttl,
+    invalidate_todo_list_cache,
+    release_todo_list_cache_lock,
+    set_todo_list_cache,
+    wait_for_todo_list_cache,
+)
 from app.config import settings
 from app.db import SessionLocal, engine, get_db, initialize_database, pool_snapshot
 from app.models import Todo
@@ -57,6 +65,21 @@ def healthcheck() -> dict[str, str]:
 @app.get("/metrics", include_in_schema=False)
 def metrics():
     return metrics_response()
+
+
+@app.get("/cache/todos/status")
+def get_todo_cache_status() -> dict[str, int | bool | None]:
+    ttl = get_todo_list_cache_ttl()
+    return {
+        "cache_present": ttl is not None and ttl >= 0,
+        "ttl_seconds": ttl,
+    }
+
+
+@app.get("/cache/todos/reset")
+def reset_todo_cache() -> dict[str, str]:
+    invalidate_todo_list_cache()
+    return {"status": "ok"}
 
 
 @app.get("/loop/fast")
@@ -218,6 +241,7 @@ async def list_todos(
     search_mode: str = Query(default="all", pattern="^(all|contains|exact)$"),
     include_tags: bool = Query(default=False),
     tag_load_strategy: str = Query(default="n_plus_one", pattern="^(n_plus_one|selectin)$"),
+    cache_strategy: str = Query(default="plain", pattern="^(plain|jitter|lock)$"),
     disable_pagination: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=5000),
@@ -235,8 +259,10 @@ async def list_todos(
         and not include_tags
         and not disable_pagination
     )
+    request.state.cache_status = "bypass"
     cached_todos = get_todo_list_cache() if use_cache else None
     if cached_todos is not None:
+        request.state.cache_status = "hit"
         logger.info(
             "todos served from cache",
             extra={
@@ -244,6 +270,7 @@ async def list_todos(
                 "extra_fields": {
                     "todo_count": len(cached_todos),
                     "cache_status": "hit",
+                    "cache_strategy": cache_strategy,
                     "search_mode": search_mode,
                     "search": search,
                     "include_tags": include_tags,
@@ -256,6 +283,54 @@ async def list_todos(
             },
         )
         return cached_todos
+
+    async def rebuild_todos_payload() -> tuple[list[Todo] | list[dict], list[Todo]]:
+        if settings.todo_cache_rebuild_delay_seconds > 0:
+            await asyncio.sleep(settings.todo_cache_rebuild_delay_seconds)
+
+        query = db.query(Todo).order_by(Todo.id.desc())
+        if search is not None:
+            if search_mode == "contains":
+                query = query.filter(Todo.title.ilike(f"%{search}%"))
+            elif search_mode == "exact":
+                query = query.filter(Todo.title == search)
+
+        if include_tags and tag_load_strategy == "selectin":
+            query = query.options(selectinload(Todo.tags))
+
+        count_query()
+        if disable_pagination:
+            todos = query.all()
+        else:
+            todos = query.offset(offset).limit(limit).all()
+
+        if include_tags:
+            if tag_load_strategy == "n_plus_one":
+                payload = []
+                for todo in todos:
+                    count_query()
+                    payload.append(
+                        {
+                            "id": todo.id,
+                            "title": todo.title,
+                            "created_at": todo.created_at,
+                            "tags": [{"id": tag.id, "label": tag.label} for tag in todo.tags],
+                        }
+                    )
+            else:
+                count_query()
+                payload = [
+                    {
+                        "id": todo.id,
+                        "title": todo.title,
+                        "created_at": todo.created_at,
+                        "tags": [{"id": tag.id, "label": tag.label} for tag in todo.tags],
+                    }
+                    for todo in todos
+                ]
+        else:
+            payload = jsonable_encoder(todos)
+        return payload, todos
 
     if settings.todo_upstream_url:
         try:
@@ -290,58 +365,58 @@ async def list_todos(
         )
         time.sleep(settings.todo_read_delay_seconds)
 
-    query = db.query(Todo).order_by(Todo.id.desc())
-    if search is not None:
-        if search_mode == "contains":
-            query = query.filter(Todo.title.ilike(f"%{search}%"))
-        elif search_mode == "exact":
-            query = query.filter(Todo.title == search)
-
-    if include_tags and tag_load_strategy == "selectin":
-        query = query.options(selectinload(Todo.tags))
-
-    count_query()
-    if disable_pagination:
-        todos = query.all()
-    else:
-        todos = query.offset(offset).limit(limit).all()
-    if include_tags:
-        if tag_load_strategy == "n_plus_one":
-            payload = []
-            for todo in todos:
-                count_query()
-                payload.append(
-                    {
-                        "id": todo.id,
-                        "title": todo.title,
-                        "created_at": todo.created_at,
-                        "tags": [{"id": tag.id, "label": tag.label} for tag in todo.tags],
-                    }
-                )
+    if use_cache and cache_strategy == "lock":
+        lock_token = acquire_todo_list_cache_lock()
+        if lock_token is not None:
+            request.state.cache_status = "lock_rebuild"
+            try:
+                payload, todos = await rebuild_todos_payload()
+                set_todo_list_cache(payload, use_jitter=True)
+            finally:
+                release_todo_list_cache_lock(lock_token)
         else:
-            count_query()
-            payload = [
-                {
-                    "id": todo.id,
-                    "title": todo.title,
-                    "created_at": todo.created_at,
-                    "tags": [{"id": tag.id, "label": tag.label} for tag in todo.tags],
-                }
-                for todo in todos
-            ]
+            request.state.cache_status = "lock_wait"
+            waited_payload = wait_for_todo_list_cache()
+            if waited_payload is not None:
+                logger.info(
+                    "todos served after cache wait",
+                    extra={
+                        "event": "list_todos",
+                        "extra_fields": {
+                            "todo_count": len(waited_payload),
+                            "cache_status": "lock_wait_hit",
+                            "cache_strategy": cache_strategy,
+                            "search_mode": search_mode,
+                            "search": search,
+                            "include_tags": include_tags,
+                            "tag_load_strategy": tag_load_strategy,
+                            "disable_pagination": disable_pagination,
+                            "limit": limit,
+                            "offset": offset,
+                            "delay_seconds": settings.todo_read_delay_seconds,
+                        },
+                    },
+                )
+                request.state.cache_status = "lock_wait_hit"
+                return waited_payload
+            request.state.cache_status = "lock_wait_fallback"
+            payload, todos = await rebuild_todos_payload()
+            set_todo_list_cache(payload, use_jitter=True)
     else:
-        payload = jsonable_encoder(todos)
+        request.state.cache_status = "miss" if use_cache else "bypass"
+        payload, todos = await rebuild_todos_payload()
+        if use_cache:
+            set_todo_list_cache(payload, use_jitter=(cache_strategy == "jitter"))
 
     request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
-    if use_cache:
-        set_todo_list_cache(payload)
     logger.info(
         "todos listed",
         extra={
             "event": "list_todos",
             "extra_fields": {
                 "todo_count": len(todos),
-                "cache_status": "miss" if use_cache else "bypass",
+                "cache_status": request.state.cache_status,
+                "cache_strategy": cache_strategy,
                 "search_mode": search_mode,
                 "search": search,
                 "include_tags": include_tags,
