@@ -2,13 +2,16 @@ import asyncio
 import json
 import logging
 import time
+import tracemalloc
+from collections import deque
 from functools import partial
 
 import httpx
+import psutil
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Request
+from fastapi import Body, Request
 from sqlalchemy import text
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, selectinload
@@ -36,6 +39,11 @@ from app.schemas import TodoCreate, TodoCursorPage, TodoRead, TodoWithTagsRead
 configure_logging()
 app = FastAPI(title=settings.app_name)
 logger = logging.getLogger("app.todos")
+memory_logger = logging.getLogger("app.memory")
+process = psutil.Process()
+LEAKY_REQUEST_BODIES: list[dict] = []
+BOUNDED_REQUEST_BODIES: deque[dict] = deque(maxlen=200)
+MEMORY_BASELINE_SNAPSHOT: tracemalloc.Snapshot | None = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,6 +57,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup() -> None:
     initialize_database()
+    tracemalloc.start()
+    global MEMORY_BASELINE_SNAPSHOT
+    MEMORY_BASELINE_SNAPSHOT = tracemalloc.take_snapshot()
     asyncio.create_task(monitor_event_loop_lag())
 
 
@@ -65,6 +76,85 @@ def healthcheck() -> dict[str, str]:
 @app.get("/metrics", include_in_schema=False)
 def metrics():
     return metrics_response()
+
+
+def _memory_stats() -> dict[str, int | float]:
+    rss_bytes = process.memory_info().rss
+    return {
+        "rss_bytes": rss_bytes,
+        "rss_mb": round(rss_bytes / (1024 * 1024), 2),
+        "leaky_items": len(LEAKY_REQUEST_BODIES),
+        "bounded_items": len(BOUNDED_REQUEST_BODIES),
+    }
+
+
+@app.get("/memory/status")
+def memory_status() -> dict[str, int | float]:
+    return _memory_stats()
+
+
+@app.post("/memory/leak")
+async def memory_leak(
+    request: Request,
+    payload: dict = Body(...),
+) -> dict[str, int | float | str]:
+    LEAKY_REQUEST_BODIES.append(payload)
+    stats = _memory_stats()
+    request.state.response_bytes = len(json.dumps(stats, default=str).encode("utf-8"))
+    memory_logger.warning(
+        "memory leak path appended payload",
+        extra={
+            "event": "memory_leak",
+            "extra_fields": stats,
+        },
+    )
+    return {"status": "ok", **stats}
+
+
+@app.post("/memory/bounded")
+async def memory_bounded(
+    request: Request,
+    payload: dict = Body(...),
+) -> dict[str, int | float | str]:
+    BOUNDED_REQUEST_BODIES.append(payload)
+    stats = _memory_stats()
+    request.state.response_bytes = len(json.dumps(stats, default=str).encode("utf-8"))
+    memory_logger.info(
+        "bounded memory path stored payload",
+        extra={
+            "event": "memory_bounded",
+            "extra_fields": stats,
+        },
+    )
+    return {"status": "ok", **stats}
+
+
+@app.post("/memory/reset")
+def memory_reset() -> dict[str, int | float | str]:
+    LEAKY_REQUEST_BODIES.clear()
+    BOUNDED_REQUEST_BODIES.clear()
+    global MEMORY_BASELINE_SNAPSHOT
+    MEMORY_BASELINE_SNAPSHOT = tracemalloc.take_snapshot()
+    return {"status": "ok", **_memory_stats()}
+
+
+@app.get("/memory/diff")
+def memory_diff(limit: int = Query(default=5, ge=1, le=20)) -> dict[str, list[dict[str, int | str | float]]]:
+    global MEMORY_BASELINE_SNAPSHOT
+    current = tracemalloc.take_snapshot()
+    baseline = MEMORY_BASELINE_SNAPSHOT or current
+    top_stats = current.compare_to(baseline, "lineno")[:limit]
+    payload = {
+        "top": [
+            {
+                "location": str(stat.traceback[0]),
+                "size_kb": round(stat.size_diff / 1024, 2),
+                "count_diff": stat.count_diff,
+            }
+            for stat in top_stats
+        ]
+    }
+    return payload
 
 
 @app.get("/cache/todos/status")

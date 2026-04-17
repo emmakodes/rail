@@ -473,3 +473,60 @@ Jitter baseline:
 - set `TODO_CACHE_TTL_JITTER_SECONDS=5`
 - use `cache_strategy=jitter`
 - this does not fix a full Redis restart on a single hot key, but it prevents synchronized TTL expiries during normal operation
+
+## Production Battlefield Scenario 08
+
+Symptom:
+
+- RAM climbs steadily until the process is restarted or OOM-killed
+
+Injection:
+
+1. Reset the in-process memory drill state:
+
+```bash
+curl -X POST "http://localhost:8000/memory/reset"
+```
+
+2. Inspect baseline memory:
+
+```bash
+curl "http://localhost:8000/memory/status"
+curl "http://localhost:8000/memory/diff"
+```
+
+3. Hammer the leaky path:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e PATH=/memory/leak -e VUS=20 -e DURATION=20s -e PAYLOAD_SIZE=50000 load-tests/todos-memory-leak.js
+```
+
+4. Inspect memory again:
+
+```bash
+curl "http://localhost:8000/memory/status"
+curl "http://localhost:8000/memory/diff"
+```
+
+What to observe:
+
+- `rss_mb` keeps growing
+- `leaky_items` keeps growing
+- `/memory/diff` points at the leaking line in `main.py`
+
+Bounded comparison:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e PATH=/memory/bounded -e VUS=20 -e DURATION=20s -e PAYLOAD_SIZE=50000 load-tests/todos-memory-leak.js
+```
+
+What should change:
+
+- `bounded_items` plateaus at its max size
+- `rss_mb` grows much more slowly or stabilizes
+
+What this drill teaches:
+
+- a module-level mutable collection written from a request path is a leak unless it is bounded
+- RSS is the production signal Railway actually OOMs on
+- `tracemalloc` tells you which line is retaining memory
