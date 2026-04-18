@@ -14,6 +14,7 @@ class Settings:
     todo_cache_lock_wait_timeout_seconds = float(os.getenv("TODO_CACHE_LOCK_WAIT_TIMEOUT_SECONDS", "6"))
     todo_cache_lock_poll_seconds = float(os.getenv("TODO_CACHE_LOCK_POLL_SECONDS", "0.05"))
     todo_cache_rebuild_delay_seconds = float(os.getenv("TODO_CACHE_REBUILD_DELAY_SECONDS", "0"))
+    todo_create_rate_limit_per_minute = int(os.getenv("TODO_CREATE_RATE_LIMIT_PER_MINUTE", "0"))
     todo_read_delay_seconds = float(os.getenv("TODO_READ_DELAY_SECONDS", "0"))
     todo_upstream_url = os.getenv("TODO_UPSTREAM_URL", "")
     todo_upstream_timeout_seconds = float(os.getenv("TODO_UPSTREAM_TIMEOUT_SECONDS", "3"))

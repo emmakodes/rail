@@ -34,6 +34,7 @@ from app.observability import (
     monitor_event_loop_lag,
     record_request_metrics,
 )
+from app.rate_limit import check_todo_create_rate_limit
 from app.schemas import TodoCreate, TodoCursorPage, TodoRead, TodoWithTagsRead
 
 configure_logging()
@@ -618,8 +619,32 @@ def explain_todos_query(
 
 
 @app.post("/todos", response_model=TodoRead, status_code=status.HTTP_201_CREATED)
-def create_todo(payload: TodoCreate, db: Session = Depends(get_db)) -> Todo:
+def create_todo(request: Request, payload: TodoCreate, db: Session = Depends(get_db)) -> Todo:
+    rate_limit = check_todo_create_rate_limit(request)
+    if rate_limit is not None:
+        request.state.rate_limit_limit = rate_limit.limit
+        request.state.rate_limit_remaining = rate_limit.remaining
+        request.state.rate_limit_reset = rate_limit.reset_seconds
+        if not rate_limit.allowed:
+            logger.warning(
+                "todo create rate limited",
+                extra={
+                    "event": "todo_create_rate_limited",
+                    "extra_fields": {
+                        "limit": rate_limit.limit,
+                        "remaining": rate_limit.remaining,
+                        "reset_seconds": rate_limit.reset_seconds,
+                        "current": rate_limit.current,
+                    },
+                },
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded for POST /todos",
+            )
+
     db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
     todo = Todo(title=payload.title.strip())
     db.add(todo)
     db.commit()

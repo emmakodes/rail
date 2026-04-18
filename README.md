@@ -530,3 +530,60 @@ What this drill teaches:
 - a module-level mutable collection written from a request path is a leak unless it is bounded
 - RSS is the production signal Railway actually OOMs on
 - `tracemalloc` tells you which line is retaining memory
+
+## Production Battlefield Scenario 09
+
+Symptom:
+
+- one client can spam `POST /todos` until write load overwhelms the app and database
+
+Injection:
+
+1. Leave the limiter off:
+
+```text
+TODO_CREATE_RATE_LIMIT_PER_MINUTE=0
+```
+
+2. Run the abuse script:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e RATE=1000 -e DURATION=10s load-tests/todos-rate-limit.js
+```
+
+What to observe:
+
+- `POST /todos` keeps accepting traffic
+- write load, DB load, and row growth all come from one client
+
+Fix direction:
+
+- enable a Redis-backed shared rate limit on `POST /todos`
+- the limiter is enforced per client IP per minute
+- responses expose:
+  - `x-rate-limit-limit`
+  - `x-rate-limit-remaining`
+  - `x-rate-limit-reset`
+
+Fix comparison:
+
+1. Set:
+
+```text
+TODO_CREATE_RATE_LIMIT_PER_MINUTE=30
+```
+
+2. Redeploy the API.
+
+3. Re-run:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e RATE=1000 -e DURATION=10s load-tests/todos-rate-limit.js
+```
+
+What should change:
+
+- early requests may still get `201`
+- after the limit is consumed, responses turn into `429`
+- rate-limit headers show the current wall
+- one abusive client can no longer push unbounded write traffic through `POST /todos`
