@@ -587,3 +587,49 @@ What should change:
 - after the limit is consumed, responses turn into `429`
 - rate-limit headers show the current wall
 - one abusive client can no longer push unbounded write traffic through `POST /todos`
+
+## Production Battlefield Scenario 10
+
+Symptom:
+
+- a slow external dependency hangs and occupies all available worker slots
+- unrelated fast endpoints slow down or time out while those slots are stuck
+
+Injection:
+
+1. Keep the defaults:
+
+```text
+EXTERNAL_HANG_URL=https://httpbin.org/delay/30
+EXTERNAL_TIMEOUT_SECONDS=3
+EXTERNAL_WORKER_LIMIT=5
+```
+
+2. Run the hanging version:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e SLOW_PATH=/external/hang -e SLOW_VUS=5 -e FAST_VUS=5 -e DURATION=20s load-tests/todos-external-timeout.js
+```
+
+What to observe:
+
+- the 5 slow calls occupy all 5 shared slots
+- `GET /external/fast` becomes slow even though its own code is tiny
+- overall throughput collapses because new work cannot get a free slot
+
+Fix direction:
+
+- put a timeout on every external call
+- free the slot as soon as the timeout is reached instead of waiting the full 30 seconds
+
+Fixed comparison:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e SLOW_PATH=/external/timeout -e SLOW_VUS=5 -e FAST_VUS=5 -e DURATION=20s load-tests/todos-external-timeout.js
+```
+
+What should change:
+
+- slow requests return `504` in about 3 seconds instead of hanging for 30 seconds
+- fast requests recover because slots are freed quickly
+- the app degrades gracefully instead of getting stuck

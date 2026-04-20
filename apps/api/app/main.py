@@ -45,6 +45,7 @@ process = psutil.Process()
 LEAKY_REQUEST_BODIES: list[dict] = []
 BOUNDED_REQUEST_BODIES: deque[dict] = deque(maxlen=200)
 MEMORY_BASELINE_SNAPSHOT: tracemalloc.Snapshot | None = None
+EXTERNAL_CALL_SEMAPHORE = asyncio.Semaphore(settings.external_worker_limit)
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,6 +78,35 @@ def healthcheck() -> dict[str, str]:
 @app.get("/metrics", include_in_schema=False)
 def metrics():
     return metrics_response()
+
+
+@app.get("/external/fast")
+async def external_fast() -> dict[str, str]:
+    async with EXTERNAL_CALL_SEMAPHORE:
+        await asyncio.sleep(0.01)
+        return {"status": "ok"}
+
+
+@app.get("/external/hang")
+async def external_hang() -> dict[str, str | float]:
+    async with EXTERNAL_CALL_SEMAPHORE:
+        async with httpx.AsyncClient(timeout=None) as client:
+            await client.get(settings.external_hang_url)
+        return {"status": "ok", "timeout_seconds": 0}
+
+
+@app.get("/external/timeout")
+async def external_timeout() -> dict[str, str | float]:
+    async with EXTERNAL_CALL_SEMAPHORE:
+        try:
+            async with httpx.AsyncClient(timeout=settings.external_timeout_seconds) as client:
+                await client.get(settings.external_hang_url)
+        except httpx.TimeoutException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="External call timed out",
+            ) from exc
+        return {"status": "ok", "timeout_seconds": settings.external_timeout_seconds}
 
 
 def _memory_stats() -> dict[str, int | float]:
