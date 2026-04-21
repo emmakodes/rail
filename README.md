@@ -633,3 +633,60 @@ What should change:
 - slow requests return `504` in about 3 seconds instead of hanging for 30 seconds
 - fast requests recover because slots are freed quickly
 - the app degrades gracefully instead of getting stuck
+
+## Production Battlefield Scenario 11
+
+Symptom:
+
+- a degraded DB triggers retries
+- retries add more DB load
+- more DB load triggers more failures
+- the whole system spirals down
+
+Injection:
+
+1. Use the broken retry-storm path:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e PATH=/resilience/retry-storm -e DELAY_SECONDS=1 -e FAIL_AFTER_DELAY=true -e VUS=20 -e DURATION=20s load-tests/todos-retry-storm.js
+```
+
+This path:
+- sleeps in the DB with `pg_sleep(1)`
+- then fails
+- retries 5 times immediately
+
+What to observe:
+
+- request latency balloons because each logical request becomes multiple physical DB hits
+- `x-retry-attempts` climbs to `5`
+
+Backoff comparison:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e PATH=/resilience/retry-backoff -e DELAY_SECONDS=1 -e FAIL_AFTER_DELAY=true -e VUS=20 -e DURATION=20s load-tests/todos-retry-storm.js
+```
+
+What should change:
+
+- retries spread out over time
+- load amplification is reduced, but retries still exist
+
+Circuit breaker comparison:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e PATH=/resilience/circuit-breaker -e DELAY_SECONDS=1 -e FAIL_AFTER_DELAY=true -e VUS=20 -e DURATION=20s load-tests/todos-retry-storm.js
+```
+
+Useful inspection endpoints:
+
+```bash
+curl "http://localhost:8000/resilience/retry/status"
+curl -X POST "http://localhost:8000/resilience/retry/reset"
+```
+
+What should change:
+
+- after enough failures, the breaker state becomes `open`
+- requests fail fast instead of continuing to hit the degraded DB
+- the feedback loop is broken because retries stop

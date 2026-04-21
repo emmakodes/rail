@@ -4,6 +4,7 @@ import logging
 import time
 import tracemalloc
 from collections import deque
+from dataclasses import dataclass
 from functools import partial
 
 import httpx
@@ -47,6 +48,37 @@ BOUNDED_REQUEST_BODIES: deque[dict] = deque(maxlen=200)
 MEMORY_BASELINE_SNAPSHOT: tracemalloc.Snapshot | None = None
 EXTERNAL_CALL_SEMAPHORE = asyncio.Semaphore(settings.external_worker_limit)
 
+
+@dataclass
+class SimpleCircuitBreaker:
+    failure_count: int = 0
+    opened_until: float = 0
+
+    @property
+    def state(self) -> str:
+        now = time.time()
+        if self.opened_until > now:
+            return "open"
+        if self.opened_until > 0 and self.failure_count >= settings.circuit_breaker_failure_threshold:
+            return "half_open"
+        return "closed"
+
+    def record_failure(self) -> None:
+        self.failure_count += 1
+        if self.failure_count >= settings.circuit_breaker_failure_threshold:
+            self.opened_until = time.time() + settings.circuit_breaker_open_seconds
+
+    def record_success(self) -> None:
+        self.failure_count = 0
+        self.opened_until = 0
+
+    def reset(self) -> None:
+        self.failure_count = 0
+        self.opened_until = 0
+
+
+DB_CIRCUIT_BREAKER = SimpleCircuitBreaker()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.parsed_cors_origins,
@@ -78,6 +110,145 @@ def healthcheck() -> dict[str, str]:
 @app.get("/metrics", include_in_schema=False)
 def metrics():
     return metrics_response()
+
+
+def _db_retry_status_payload() -> dict[str, float | int | str]:
+    return {
+        "failure_count": DB_CIRCUIT_BREAKER.failure_count,
+        "state": DB_CIRCUIT_BREAKER.state,
+        "opened_until_epoch": round(DB_CIRCUIT_BREAKER.opened_until, 2),
+    }
+
+
+def _run_artificially_slow_db(
+    request: Request,
+    db: Session,
+    *,
+    delay_seconds: float,
+    fail_after_delay: bool,
+) -> None:
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+    db.execute(text("SELECT pg_sleep(:delay_seconds)"), {"delay_seconds": delay_seconds})
+    if fail_after_delay:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Artificial DB slowdown triggered an error",
+        )
+
+
+@app.get("/resilience/retry/status")
+def resilience_retry_status() -> dict[str, float | int | str]:
+    return _db_retry_status_payload()
+
+
+@app.post("/resilience/retry/reset")
+def resilience_retry_reset() -> dict[str, float | int | str]:
+    DB_CIRCUIT_BREAKER.reset()
+    return _db_retry_status_payload()
+
+
+@app.get("/resilience/retry-storm")
+def resilience_retry_storm(
+    request: Request,
+    delay_seconds: float = Query(default=1.0, ge=0.1, le=10.0),
+    fail_after_delay: bool = Query(default=True),
+    db: Session = Depends(get_db),
+) -> dict[str, float | int | str]:
+    last_error: HTTPException | None = None
+    attempts = settings.retry_storm_attempts
+
+    for attempt in range(1, attempts + 1):
+        try:
+            _run_artificially_slow_db(
+                request,
+                db,
+                delay_seconds=delay_seconds,
+                fail_after_delay=fail_after_delay,
+            )
+            request.state.retry_attempts = attempt
+            return {"status": "ok", "retry_attempts": attempt, "delay_seconds": delay_seconds}
+        except HTTPException as exc:
+            last_error = exc
+
+    request.state.retry_attempts = attempts
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=f"Retry storm exhausted {attempts} attempts",
+    ) from last_error
+
+
+@app.get("/resilience/retry-backoff")
+async def resilience_retry_backoff(
+    request: Request,
+    delay_seconds: float = Query(default=1.0, ge=0.1, le=10.0),
+    fail_after_delay: bool = Query(default=True),
+    db: Session = Depends(get_db),
+) -> dict[str, float | int | str]:
+    last_error: HTTPException | None = None
+    attempts = settings.retry_storm_attempts
+
+    for attempt in range(1, attempts + 1):
+        try:
+            _run_artificially_slow_db(
+                request,
+                db,
+                delay_seconds=delay_seconds,
+                fail_after_delay=fail_after_delay,
+            )
+            request.state.retry_attempts = attempt
+            return {"status": "ok", "retry_attempts": attempt, "delay_seconds": delay_seconds}
+        except HTTPException as exc:
+            last_error = exc
+            if attempt < attempts:
+                await asyncio.sleep(settings.retry_backoff_base_seconds * (2 ** (attempt - 1)))
+
+    request.state.retry_attempts = attempts
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=f"Backoff retries exhausted {attempts} attempts",
+    ) from last_error
+
+
+@app.get("/resilience/circuit-breaker")
+def resilience_circuit_breaker(
+    request: Request,
+    delay_seconds: float = Query(default=1.0, ge=0.1, le=10.0),
+    fail_after_delay: bool = Query(default=True),
+    db: Session = Depends(get_db),
+) -> dict[str, float | int | str]:
+    state = DB_CIRCUIT_BREAKER.state
+    request.state.circuit_state = state
+    if state == "open":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Circuit breaker is open",
+        )
+
+    try:
+        _run_artificially_slow_db(
+            request,
+            db,
+            delay_seconds=delay_seconds,
+            fail_after_delay=fail_after_delay,
+        )
+    except HTTPException as exc:
+        DB_CIRCUIT_BREAKER.record_failure()
+        request.state.circuit_state = DB_CIRCUIT_BREAKER.state
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Circuit breaker blocked the degraded dependency",
+        ) from exc
+
+    DB_CIRCUIT_BREAKER.record_success()
+    request.state.circuit_state = DB_CIRCUIT_BREAKER.state
+    request.state.retry_attempts = 1
+    return {
+        "status": "ok",
+        "retry_attempts": 1,
+        "delay_seconds": delay_seconds,
+        **_db_retry_status_payload(),
+    }
 
 
 @app.get("/external/fast")

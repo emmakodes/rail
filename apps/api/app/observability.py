@@ -111,6 +111,8 @@ async def record_request_metrics(request: Request, call_next) -> Response:
     request.state.rate_limit_limit = None
     request.state.rate_limit_remaining = None
     request.state.rate_limit_reset = None
+    request.state.retry_attempts = None
+    request.state.circuit_state = None
     started_at = time.perf_counter()
     logger = logging.getLogger("app.request")
     method = request.method
@@ -149,6 +151,10 @@ async def record_request_metrics(request: Request, call_next) -> Response:
         response.headers["x-rate-limit-limit"] = str(request.state.rate_limit_limit)
         response.headers["x-rate-limit-remaining"] = str(request.state.rate_limit_remaining)
         response.headers["x-rate-limit-reset"] = str(request.state.rate_limit_reset)
+    if getattr(request.state, "retry_attempts", None) is not None:
+        response.headers["x-retry-attempts"] = str(request.state.retry_attempts)
+    if getattr(request.state, "circuit_state", None) is not None:
+        response.headers["x-circuit-state"] = str(request.state.circuit_state)
 
     logger.info(
         "request completed",
@@ -163,6 +169,8 @@ async def record_request_metrics(request: Request, call_next) -> Response:
                 "response_bytes": getattr(request.state, "response_bytes", 0),
                 "cache_status": getattr(request.state, "cache_status", "-"),
                 "rate_limit_remaining": getattr(request.state, "rate_limit_remaining", None),
+                "retry_attempts": getattr(request.state, "retry_attempts", None),
+                "circuit_state": getattr(request.state, "circuit_state", None),
                 "client_ip": request.client.host if request.client else None,
             },
         },
