@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -8,11 +9,13 @@ from dataclasses import dataclass
 from functools import partial
 
 import httpx
+import orjson
 import psutil
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Body, Request
+from fastapi.responses import Response
 from sqlalchemy import text
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, selectinload
@@ -37,6 +40,7 @@ from app.observability import (
 )
 from app.rate_limit import check_todo_create_rate_limit
 from app.schemas import TodoCreate, TodoCursorPage, TodoRead, TodoWithTagsRead
+from app.schemas import TodoSerializationHeavyItem, TodoSerializationListItem
 
 configure_logging()
 app = FastAPI(title=settings.app_name)
@@ -110,6 +114,197 @@ def healthcheck() -> dict[str, str]:
 @app.get("/metrics", include_in_schema=False)
 def metrics():
     return metrics_response()
+
+
+def _serialization_note_map(base_text: str) -> dict[str, str]:
+    return {f"note_{index:02d}": f"{base_text} field {index}" for index in range(1, 43)}
+
+
+def _build_heavy_item(row: dict[str, str]) -> dict[str, str]:
+    base_text = f"{row['title']} {row['id']}"
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "created_at": row["created_at"],
+        "status": "open",
+        "priority": "medium",
+        "category": "serialization-drill",
+        "owner": "api",
+        "description": f"{base_text} description",
+        **_serialization_note_map(base_text),
+    }
+
+
+def _add_serialization_headers(
+    response: Response,
+    *,
+    db_ms: float,
+    orm_hydrate_ms: float,
+    pydantic_ms: float,
+    json_encode_ms: float,
+    response_bytes: int,
+) -> None:
+    response.headers["x-db-ms"] = str(round(db_ms, 2))
+    response.headers["x-orm-hydrate-ms"] = str(round(orm_hydrate_ms, 2))
+    response.headers["x-pydantic-ms"] = str(round(pydantic_ms, 2))
+    response.headers["x-json-encode-ms"] = str(round(json_encode_ms, 2))
+    response.headers["x-response-bytes"] = str(response_bytes)
+
+
+@app.get("/serialization/todos/slow")
+def serialization_todos_slow(
+    request: Request,
+    row_count: int = Query(default=500, ge=20, le=10000),
+    db: Session = Depends(get_db),
+) -> Response:
+    db_started_at = time.perf_counter()
+    rows = db.execute(
+        text(
+            """
+            SELECT id, title, created_at
+            FROM todos
+            ORDER BY id DESC
+            LIMIT :row_count
+            """
+        ),
+        {"row_count": row_count},
+    ).mappings().all()
+    db_ms = (time.perf_counter() - db_started_at) * 1000
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+
+    orm_started_at = time.perf_counter()
+    hydrated = [_build_heavy_item(dict(row)) for row in rows]
+    orm_hydrate_ms = (time.perf_counter() - orm_started_at) * 1000
+
+    pydantic_started_at = time.perf_counter()
+    validated = [TodoSerializationHeavyItem.model_validate(item) for item in hydrated]
+    pydantic_ms = (time.perf_counter() - pydantic_started_at) * 1000
+
+    json_started_at = time.perf_counter()
+    encoded = json.dumps([item.model_dump(mode="json") for item in validated], default=str).encode("utf-8")
+    json_encode_ms = (time.perf_counter() - json_started_at) * 1000
+
+    request.state.response_bytes = len(encoded)
+    logger.info(
+        "serialization slow path completed",
+        extra={
+            "event": "serialization_profile",
+            "extra_fields": {
+                "row_count": row_count,
+                "db_ms": round(db_ms, 2),
+                "orm_hydrate_ms": round(orm_hydrate_ms, 2),
+                "pydantic_ms": round(pydantic_ms, 2),
+                "json_encode_ms": round(json_encode_ms, 2),
+                "response_bytes": len(encoded),
+                "serialization_mode": "slow",
+            },
+        },
+    )
+    response = Response(content=encoded, media_type="application/json")
+    _add_serialization_headers(
+        response,
+        db_ms=db_ms,
+        orm_hydrate_ms=orm_hydrate_ms,
+        pydantic_ms=pydantic_ms,
+        json_encode_ms=json_encode_ms,
+        response_bytes=len(encoded),
+    )
+    return response
+
+
+@app.get("/serialization/todos/fixed")
+def serialization_todos_fixed(
+    request: Request,
+    row_count: int = Query(default=500, ge=20, le=10000),
+    db: Session = Depends(get_db),
+) -> Response:
+    db_started_at = time.perf_counter()
+    rows = db.execute(
+        text(
+            """
+            SELECT id, title, created_at
+            FROM todos
+            ORDER BY id DESC
+            LIMIT :row_count
+            """
+        ),
+        {"row_count": row_count},
+    ).mappings().all()
+    db_ms = (time.perf_counter() - db_started_at) * 1000
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+
+    orm_started_at = time.perf_counter()
+    hydrated = [dict(row) for row in rows]
+    orm_hydrate_ms = (time.perf_counter() - orm_started_at) * 1000
+
+    pydantic_started_at = time.perf_counter()
+    validated = [TodoSerializationListItem.model_validate(item) for item in hydrated]
+    pydantic_ms = (time.perf_counter() - pydantic_started_at) * 1000
+
+    json_started_at = time.perf_counter()
+    payload = [item.model_dump(mode="json") for item in validated]
+    encoded = orjson.dumps(payload)
+    json_encode_ms = (time.perf_counter() - json_started_at) * 1000
+
+    etag = hashlib.sha256(encoded).hexdigest()
+    if request.headers.get("if-none-match") == etag:
+        response = Response(status_code=status.HTTP_304_NOT_MODIFIED)
+        response.headers["etag"] = etag
+        _add_serialization_headers(
+            response,
+            db_ms=db_ms,
+            orm_hydrate_ms=orm_hydrate_ms,
+            pydantic_ms=pydantic_ms,
+            json_encode_ms=json_encode_ms,
+            response_bytes=0,
+        )
+        request.state.response_bytes = 0
+        logger.info(
+            "serialization fixed path returned 304",
+            extra={
+                "event": "serialization_profile",
+                "extra_fields": {
+                    "row_count": row_count,
+                    "db_ms": round(db_ms, 2),
+                    "orm_hydrate_ms": round(orm_hydrate_ms, 2),
+                    "pydantic_ms": round(pydantic_ms, 2),
+                    "json_encode_ms": round(json_encode_ms, 2),
+                    "response_bytes": 0,
+                    "serialization_mode": "fixed_304",
+                },
+            },
+        )
+        return response
+
+    request.state.response_bytes = len(encoded)
+    logger.info(
+        "serialization fixed path completed",
+        extra={
+            "event": "serialization_profile",
+            "extra_fields": {
+                "row_count": row_count,
+                "db_ms": round(db_ms, 2),
+                "orm_hydrate_ms": round(orm_hydrate_ms, 2),
+                "pydantic_ms": round(pydantic_ms, 2),
+                "json_encode_ms": round(json_encode_ms, 2),
+                "response_bytes": len(encoded),
+                "serialization_mode": "fixed",
+            },
+        },
+    )
+    response = Response(content=encoded, media_type="application/json")
+    response.headers["etag"] = etag
+    _add_serialization_headers(
+        response,
+        db_ms=db_ms,
+        orm_hydrate_ms=orm_hydrate_ms,
+        pydantic_ms=pydantic_ms,
+        json_encode_ms=json_encode_ms,
+        response_bytes=len(encoded),
+    )
+    return response
 
 
 def _db_retry_status_payload() -> dict[str, float | int | str]:

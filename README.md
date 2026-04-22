@@ -188,9 +188,81 @@ Scenario 02 fix now applied:
 - `/todos` is paginated with `limit` and `offset`
 - default `limit=50`, max `limit=100`
 - startup creates:
-  - `ix_todos_title`
-  - `pg_trgm` extension
-  - `ix_todos_title_trgm`
+- `ix_todos_title`
+- `pg_trgm` extension
+- `ix_todos_title_trgm`
+
+## Production Battlefield Scenario 15
+
+Symptom:
+
+- `GET /todos` is fast in the database but slow in validation and JSON serialization
+
+Injection:
+
+1. Hit the deliberately heavy path:
+
+```bash
+curl -i "http://localhost:8000/serialization/todos/slow?row_count=500"
+```
+
+What to inspect:
+
+- `x-db-ms`
+- `x-orm-hydrate-ms`
+- `x-pydantic-ms`
+- `x-json-encode-ms`
+- `x-response-bytes`
+
+This path returns a large 50-field response model per row using stdlib JSON so the serialization cost is obvious.
+
+2. Load test it:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e PATH=/serialization/todos/slow -e ROW_COUNT=500 -e VUS=5 -e DURATION=20s load-tests/todos-serialization.js
+```
+
+What to observe:
+
+- `db_ms` stays relatively small
+- `pydantic_ms` and `json_encode_ms` dominate as row count grows
+
+Fix comparison:
+
+1. Hit the leaner/faster path:
+
+```bash
+curl -i "http://localhost:8000/serialization/todos/fixed?row_count=500"
+```
+
+This path:
+
+- uses a lean list-item schema instead of a 50-field payload
+- uses `orjson` for response encoding
+- emits an `ETag`
+
+2. Load test the fixed path:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e PATH=/serialization/todos/fixed -e ROW_COUNT=500 -e VUS=5 -e DURATION=20s load-tests/todos-serialization.js
+```
+
+3. ETag comparison:
+
+```bash
+curl -i "http://localhost:8000/serialization/todos/fixed?row_count=500"
+```
+
+Copy the `etag` header from that response, then:
+
+```bash
+curl -i -H "If-None-Match: <etag-from-previous-response>" "http://localhost:8000/serialization/todos/fixed?row_count=500"
+```
+
+What should change:
+
+- fixed path should show much lower `pydantic_ms` and `json_encode_ms`
+- repeated request with the same ETag should return `304` with no body
 
 ## Production Battlefield Scenario 03
 
