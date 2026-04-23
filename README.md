@@ -59,6 +59,7 @@ Useful env vars:
 
 - API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`
 - API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_CACHE_TTL_JITTER_SECONDS`, `TODO_CACHE_LOCK_TIMEOUT_SECONDS`, `TODO_CACHE_LOCK_WAIT_TIMEOUT_SECONDS`, `TODO_CACHE_LOCK_POLL_SECONDS`, `TODO_CACHE_REBUILD_DELAY_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`
+- API: `MIGRATION_READ_LOCK_TIMEOUT_SECONDS`, `MIGRATION_DANGEROUS_HOLD_SECONDS`, `MIGRATION_BACKFILL_BATCH_SIZE`, `MIGRATION_BACKFILL_PAUSE_SECONDS`, `MIGRATION_LOCK_TIMEOUT_SECONDS`
 - Web: `NEXT_PUBLIC_API_BASE_URL`
 
 Recommended Railway values:
@@ -78,6 +79,11 @@ Recommended Railway values:
 - `DB_POOL_SIZE`: `5` normally, `3` for the pool exhaustion drill
 - `DB_MAX_OVERFLOW`: `10` normally, `0` for the pool exhaustion drill
 - `DB_POOL_TIMEOUT_SECONDS`: `30` normally, `1` to surface pool timeout quickly
+- `MIGRATION_READ_LOCK_TIMEOUT_SECONDS`: `1`
+- `MIGRATION_DANGEROUS_HOLD_SECONDS`: `15`
+- `MIGRATION_BACKFILL_BATCH_SIZE`: `5000`
+- `MIGRATION_BACKFILL_PAUSE_SECONDS`: `0.05`
+- `MIGRATION_LOCK_TIMEOUT_SECONDS`: `5`
 - `NEXT_PUBLIC_API_BASE_URL`: `https://<your-api-domain>`
 
 Railway config files:
@@ -258,6 +264,114 @@ Copy the `etag` header from that response, then:
 ```bash
 curl -i -H "If-None-Match: <etag-from-previous-response>" "http://localhost:8000/serialization/todos/fixed?row_count=500"
 ```
+
+## Production Battlefield Scenario 16
+
+Symptom:
+
+- a dangerous DDL change acquires an exclusive lock on `todos`
+- reads pile up behind it and start failing
+
+This repo now includes a drill path that makes the lock visible without requiring Alembic first.
+
+Recommended setup:
+
+1. Seed a large table:
+
+```bash
+cd apps/api
+PYTHONPATH=. python scripts/seed_todos.py --count 1000000 --batch-size 5000
+```
+
+2. Inspect drill status:
+
+```bash
+curl "http://localhost:8000/migrations/zero-downtime/status"
+```
+
+Dangerous migration drill:
+
+1. Reset drill state:
+
+```bash
+curl -X POST "http://localhost:8000/migrations/zero-downtime/reset"
+```
+
+2. Start the dangerous path:
+
+```bash
+curl -X POST "http://localhost:8000/migrations/zero-downtime/dangerous/start"
+```
+
+This path:
+
+- takes an `ACCESS EXCLUSIVE` lock on `todos`
+- adds a column with a default
+- deliberately holds the lock open
+
+3. Hammer reads while the lock is held:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e MODE=dangerous -e VUS=10 -e DURATION=20s load-tests/todos-migration-locks.js
+```
+
+What to observe:
+
+- `GET /migrations/zero-downtime/read` starts returning `500`
+- drill status shows `mode=dangerous`
+- logs show `event=migration_drill`
+
+Zero-downtime comparison:
+
+1. Reset:
+
+```bash
+curl -X POST "http://localhost:8000/migrations/zero-downtime/reset"
+```
+
+2. Start the safe expand-contract path:
+
+```bash
+curl -X POST "http://localhost:8000/migrations/zero-downtime/safe/start"
+```
+
+This path:
+
+- adds a nullable column first
+- backfills in batches
+- sets a default later
+- adds `CHECK (...) NOT VALID`
+- validates the constraint separately
+- builds an index with `CONCURRENTLY`
+
+3. Hammer reads during the safe migration:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e MODE=safe -e VUS=10 -e DURATION=20s load-tests/todos-migration-locks.js
+```
+
+What to observe:
+
+- reads stay `200`
+- status moves through `expand`, `backfill`, `validate`, and `create_index_concurrently`
+- users should not see lock-induced failures
+
+Separate migration service pattern:
+
+- do not run schema migrations in the API startup command
+- run them in a separate Railway service/job first
+- this repo includes `apps/api/scripts/run_safe_todo_migration.py` as that safe migration entrypoint
+
+Example Railway migration start command:
+
+```bash
+PYTHONPATH=. python scripts/run_safe_todo_migration.py
+```
+
+Safety knob:
+
+- set `MIGRATION_LOCK_TIMEOUT_SECONDS=5`
+- if the migration cannot acquire the needed lock quickly, it fails fast instead of silently queuing application traffic behind it
 
 What should change:
 

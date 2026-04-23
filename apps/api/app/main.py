@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 import time
 import tracemalloc
 from collections import deque
@@ -17,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Body, Request
 from fastapi.responses import Response
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, selectinload
 
@@ -82,6 +84,21 @@ class SimpleCircuitBreaker:
 
 
 DB_CIRCUIT_BREAKER = SimpleCircuitBreaker()
+
+
+@dataclass
+class MigrationDrillState:
+    running: bool = False
+    mode: str = "idle"
+    step: str = "idle"
+    last_error: str | None = None
+    started_at_epoch: float = 0
+    completed_at_epoch: float = 0
+    rows_backfilled: int = 0
+
+
+MIGRATION_DRILL_STATE = MigrationDrillState()
+MIGRATION_DRILL_STATE_LOCK = threading.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -149,6 +166,234 @@ def _add_serialization_headers(
     response.headers["x-pydantic-ms"] = str(round(pydantic_ms, 2))
     response.headers["x-json-encode-ms"] = str(round(json_encode_ms, 2))
     response.headers["x-response-bytes"] = str(response_bytes)
+
+
+def _migration_status_payload() -> dict[str, float | int | str | bool | None]:
+    with MIGRATION_DRILL_STATE_LOCK:
+        return {
+            "running": MIGRATION_DRILL_STATE.running,
+            "mode": MIGRATION_DRILL_STATE.mode,
+            "step": MIGRATION_DRILL_STATE.step,
+            "last_error": MIGRATION_DRILL_STATE.last_error,
+            "started_at_epoch": round(MIGRATION_DRILL_STATE.started_at_epoch, 2),
+            "completed_at_epoch": round(MIGRATION_DRILL_STATE.completed_at_epoch, 2),
+            "rows_backfilled": MIGRATION_DRILL_STATE.rows_backfilled,
+        }
+
+
+def _update_migration_state(**changes: object) -> None:
+    with MIGRATION_DRILL_STATE_LOCK:
+        for key, value in changes.items():
+            setattr(MIGRATION_DRILL_STATE, key, value)
+
+
+def _lock_timeout_sql(seconds: float) -> str:
+    return f"{max(seconds, 0.001):.3f}s"
+
+
+def _migration_drill_cleanup() -> None:
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE todos DROP CONSTRAINT IF EXISTS todos_migration_status_not_null"))
+        connection.execute(text("DROP INDEX IF EXISTS ix_todos_migration_status"))
+        connection.execute(text("ALTER TABLE todos DROP COLUMN IF EXISTS migration_status"))
+        connection.execute(text("ALTER TABLE todos DROP COLUMN IF EXISTS migration_blocking_default"))
+
+
+def _run_dangerous_migration() -> None:
+    logger.info(
+        "dangerous migration drill started",
+        extra={
+            "event": "migration_drill",
+            "extra_fields": {
+                "migration_mode": "dangerous",
+                "hold_seconds": settings.migration_dangerous_hold_seconds,
+            },
+        },
+    )
+    _update_migration_state(
+        running=True,
+        mode="dangerous",
+        step="acquiring_access_exclusive_lock",
+        last_error=None,
+        started_at_epoch=time.time(),
+        completed_at_epoch=0,
+        rows_backfilled=0,
+    )
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("LOCK TABLE todos IN ACCESS EXCLUSIVE MODE"))
+            _update_migration_state(step="holding_access_exclusive_lock")
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE todos
+                    ADD COLUMN IF NOT EXISTS migration_blocking_default TEXT DEFAULT 'pending'
+                    """
+                )
+            )
+            connection.execute(
+                text("SELECT pg_sleep(:hold_seconds)"),
+                {"hold_seconds": settings.migration_dangerous_hold_seconds},
+            )
+        _update_migration_state(
+            running=False,
+            mode="dangerous",
+            step="completed",
+            completed_at_epoch=time.time(),
+        )
+    except Exception as exc:
+        logger.exception(
+            "dangerous migration drill failed",
+            extra={
+                "event": "migration_drill",
+                "extra_fields": {
+                    "migration_mode": "dangerous",
+                    "step": "failed",
+                },
+            },
+        )
+        _update_migration_state(
+            running=False,
+            mode="dangerous",
+            step="failed",
+            last_error=str(exc),
+            completed_at_epoch=time.time(),
+        )
+
+
+def _backfill_migration_status(batch_size: int) -> int:
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                """
+                WITH batch AS (
+                    SELECT id
+                    FROM todos
+                    WHERE migration_status IS NULL
+                    ORDER BY id
+                    LIMIT :batch_size
+                )
+                UPDATE todos
+                SET migration_status = 'legacy'
+                WHERE id IN (SELECT id FROM batch)
+                RETURNING id
+                """
+            ),
+            {"batch_size": batch_size},
+        ).fetchall()
+    return len(rows)
+
+
+def _run_safe_migration() -> None:
+    logger.info(
+        "safe migration drill started",
+        extra={
+            "event": "migration_drill",
+            "extra_fields": {
+                "migration_mode": "safe",
+                "batch_size": settings.migration_backfill_batch_size,
+            },
+        },
+    )
+    _update_migration_state(
+        running=True,
+        mode="safe",
+        step="expand_add_nullable_column",
+        last_error=None,
+        started_at_epoch=time.time(),
+        completed_at_epoch=0,
+        rows_backfilled=0,
+    )
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(f"SET LOCAL lock_timeout = '{_lock_timeout_sql(settings.migration_lock_timeout_seconds)}'"))
+            connection.execute(text("ALTER TABLE todos ADD COLUMN IF NOT EXISTS migration_status TEXT"))
+
+        _update_migration_state(step="backfill_batches")
+        total_backfilled = 0
+        while True:
+            updated = _backfill_migration_status(settings.migration_backfill_batch_size)
+            total_backfilled += updated
+            _update_migration_state(rows_backfilled=total_backfilled)
+            if updated == 0:
+                break
+            if settings.migration_backfill_pause_seconds > 0:
+                time.sleep(settings.migration_backfill_pause_seconds)
+
+        _update_migration_state(step="set_default")
+        with engine.begin() as connection:
+            connection.execute(text(f"SET LOCAL lock_timeout = '{_lock_timeout_sql(settings.migration_lock_timeout_seconds)}'"))
+            connection.execute(text("ALTER TABLE todos ALTER COLUMN migration_status SET DEFAULT 'legacy'"))
+
+        _update_migration_state(step="add_not_valid_constraint")
+        with engine.begin() as connection:
+            connection.execute(text(f"SET LOCAL lock_timeout = '{_lock_timeout_sql(settings.migration_lock_timeout_seconds)}'"))
+            constraint_exists = connection.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'todos_migration_status_not_null'
+                    """
+                )
+            ).scalar()
+            if not constraint_exists:
+                connection.execute(
+                    text(
+                        """
+                        ALTER TABLE todos
+                        ADD CONSTRAINT todos_migration_status_not_null
+                        CHECK (migration_status IS NOT NULL) NOT VALID
+                        """
+                    )
+                )
+
+        _update_migration_state(step="validate_constraint")
+        with engine.begin() as connection:
+            connection.execute(text(f"SET LOCAL lock_timeout = '{_lock_timeout_sql(settings.migration_lock_timeout_seconds)}'"))
+            connection.execute(text("ALTER TABLE todos VALIDATE CONSTRAINT todos_migration_status_not_null"))
+
+        _update_migration_state(step="create_index_concurrently")
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            connection.execute(text(f"SET lock_timeout = '{_lock_timeout_sql(settings.migration_lock_timeout_seconds)}'"))
+            connection.execute(text("CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_todos_migration_status ON todos (migration_status)"))
+
+        _update_migration_state(
+            running=False,
+            mode="safe",
+            step="completed",
+            completed_at_epoch=time.time(),
+            rows_backfilled=total_backfilled,
+        )
+    except Exception as exc:
+        logger.exception(
+            "safe migration drill failed",
+            extra={
+                "event": "migration_drill",
+                "extra_fields": {
+                    "migration_mode": "safe",
+                    "step": "failed",
+                },
+            },
+        )
+        _update_migration_state(
+            running=False,
+            mode="safe",
+            step="failed",
+            last_error=str(exc),
+            completed_at_epoch=time.time(),
+        )
+
+
+def _start_migration_thread(target: callable, *, mode: str) -> None:
+    with MIGRATION_DRILL_STATE_LOCK:
+        if MIGRATION_DRILL_STATE.running:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"{MIGRATION_DRILL_STATE.mode} migration drill already running",
+            )
+    thread = threading.Thread(target=target, name=f"migration-drill-{mode}", daemon=True)
+    thread.start()
 
 
 @app.get("/serialization/todos/slow")
@@ -305,6 +550,93 @@ def serialization_todos_fixed(
         response_bytes=len(encoded),
     )
     return response
+
+
+@app.get("/migrations/zero-downtime/status")
+def migration_zero_downtime_status() -> dict[str, float | int | str | bool | None]:
+    return _migration_status_payload()
+
+
+@app.post("/migrations/zero-downtime/reset")
+def migration_zero_downtime_reset() -> dict[str, float | int | str | bool | None]:
+    status_payload = _migration_status_payload()
+    if status_payload["running"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot reset while a migration drill is still running",
+        )
+    _migration_drill_cleanup()
+    _update_migration_state(
+        running=False,
+        mode="idle",
+        step="idle",
+        last_error=None,
+        started_at_epoch=0,
+        completed_at_epoch=0,
+        rows_backfilled=0,
+    )
+    return _migration_status_payload()
+
+
+@app.post("/migrations/zero-downtime/dangerous/start")
+def migration_zero_downtime_dangerous_start() -> dict[str, float | int | str | bool | None]:
+    _start_migration_thread(_run_dangerous_migration, mode="dangerous")
+    return _migration_status_payload()
+
+
+@app.post("/migrations/zero-downtime/safe/start")
+def migration_zero_downtime_safe_start() -> dict[str, float | int | str | bool | None]:
+    _start_migration_thread(_run_safe_migration, mode="safe")
+    return _migration_status_payload()
+
+
+@app.get("/migrations/zero-downtime/read")
+def migration_zero_downtime_read(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> dict[str, float | int | str]:
+    try:
+        db.execute(text(f"SET LOCAL lock_timeout = '{_lock_timeout_sql(settings.migration_read_lock_timeout_seconds)}'"))
+        started_at = time.perf_counter()
+        rows = db.execute(
+            text(
+                """
+                SELECT id, title, created_at
+                FROM todos
+                ORDER BY id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": limit},
+        ).mappings().all()
+        db_ms = (time.perf_counter() - started_at) * 1000
+        db.info["query_count"] = db.info.get("query_count", 0) + 1
+        request.state.db_query_count = db.info["query_count"]
+    except OperationalError as exc:
+        logger.warning(
+            "migration drill read blocked by lock",
+            extra={
+                "event": "migration_drill",
+                "extra_fields": {
+                    "migration_mode": _migration_status_payload()["mode"],
+                    "step": _migration_status_payload()["step"],
+                    "read_status": "blocked",
+                },
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Migration lock blocked the read before lock_timeout expired",
+        ) from exc
+
+    return {
+        "status": "ok",
+        "row_count": len(rows),
+        "db_ms": round(db_ms, 2),
+        "migration_mode": str(_migration_status_payload()["mode"]),
+        "migration_step": str(_migration_status_payload()["step"]),
+    }
 
 
 def _db_retry_status_payload() -> dict[str, float | int | str]:
