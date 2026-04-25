@@ -32,7 +32,7 @@ from app.cache import (
     wait_for_todo_list_cache,
 )
 from app.config import settings
-from app.db import SessionLocal, engine, get_db, initialize_database, pool_snapshot
+from app.db import SessionLocal, engine, fk_index_audit_rows, get_db, initialize_database, pool_snapshot
 from app.models import Todo
 from app.observability import (
     configure_logging,
@@ -53,6 +53,8 @@ LEAKY_REQUEST_BODIES: list[dict] = []
 BOUNDED_REQUEST_BODIES: deque[dict] = deque(maxlen=200)
 MEMORY_BASELINE_SNAPSHOT: tracemalloc.Snapshot | None = None
 EXTERNAL_CALL_SEMAPHORE = asyncio.Semaphore(settings.external_worker_limit)
+FK_BASIC_INDEX_NAME = "ix_todos_user_id"
+FK_COMPOSITE_INDEX_NAME = "ix_todos_user_id_completed_created_at"
 
 
 @dataclass
@@ -396,6 +398,72 @@ def _start_migration_thread(target: callable, *, mode: str) -> None:
     thread.start()
 
 
+def _fk_index_status_payload(db: Session) -> dict[str, object]:
+    todos_total = db.execute(text("SELECT count(*) FROM todos")).scalar_one()
+    users_total = db.execute(text("SELECT count(*) FROM users")).scalar_one()
+    assigned_todos = db.execute(text("SELECT count(*) FROM todos WHERE user_id IS NOT NULL")).scalar_one()
+    hot_user_row = db.execute(
+        text(
+            """
+            SELECT user_id, count(*)::int AS todo_count
+            FROM todos
+            WHERE user_id IS NOT NULL
+            GROUP BY user_id
+            ORDER BY todo_count DESC, user_id
+            LIMIT 1
+            """
+        )
+    ).mappings().first()
+    index_row = db.execute(
+        text(
+            """
+            SELECT
+                to_regclass(:basic_index_name) IS NOT NULL AS basic_index_present,
+                to_regclass(:composite_index_name) IS NOT NULL AS composite_index_present
+            """
+        ),
+        {
+            "basic_index_name": f"public.{FK_BASIC_INDEX_NAME}",
+            "composite_index_name": f"public.{FK_COMPOSITE_INDEX_NAME}",
+        },
+    ).mappings().one()
+    missing_indexes = fk_index_audit_rows(db)
+    return {
+        "todos_total": todos_total,
+        "users_total": users_total,
+        "assigned_todos": assigned_todos,
+        "hot_user_id": hot_user_row["user_id"] if hot_user_row else None,
+        "hot_user_todo_count": hot_user_row["todo_count"] if hot_user_row else 0,
+        "basic_index_present": bool(index_row["basic_index_present"]),
+        "composite_index_present": bool(index_row["composite_index_present"]),
+        "missing_fk_indexes": missing_indexes,
+    }
+
+
+def _fk_join_sql(*, completed_only: bool) -> str:
+    completed_filter = "AND t.completed = false" if completed_only else ""
+    return f"""
+        SELECT
+            t.id,
+            t.title,
+            t.created_at,
+            t.completed,
+            u.id AS user_id,
+            u.email
+        FROM users u
+        JOIN todos t ON t.user_id = u.id
+        WHERE u.id = :user_id
+        {completed_filter}
+        ORDER BY t.created_at DESC
+        LIMIT :limit
+    """
+
+
+def _run_fk_index_ddl(statement: str) -> None:
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(text(statement))
+
+
 @app.get("/serialization/todos/slow")
 def serialization_todos_slow(
     request: Request,
@@ -637,6 +705,118 @@ def migration_zero_downtime_read(
         "migration_mode": str(_migration_status_payload()["mode"]),
         "migration_step": str(_migration_status_payload()["step"]),
     }
+
+
+@app.get("/fk-index/status")
+def fk_index_status(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    db.info["query_count"] = db.info.get("query_count", 0) + 6
+    request.state.db_query_count = db.info["query_count"]
+    payload = _fk_index_status_payload(db)
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
+    return payload
+
+
+@app.get("/fk-index/audit")
+def fk_index_audit(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, list[dict[str, object]]]:
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+    payload = {"missing_indexes": fk_index_audit_rows(db)}
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
+    return payload
+
+
+@app.post("/fk-index/index/drop")
+def fk_index_drop() -> dict[str, str]:
+    _run_fk_index_ddl(f"DROP INDEX CONCURRENTLY IF EXISTS {FK_COMPOSITE_INDEX_NAME}")
+    _run_fk_index_ddl(f"DROP INDEX CONCURRENTLY IF EXISTS {FK_BASIC_INDEX_NAME}")
+    return {"status": "ok"}
+
+
+@app.post("/fk-index/index/basic")
+def fk_index_basic() -> dict[str, str]:
+    _run_fk_index_ddl(
+        f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {FK_BASIC_INDEX_NAME} ON todos (user_id)"
+    )
+    return {"status": "ok"}
+
+
+@app.post("/fk-index/index/composite")
+def fk_index_composite() -> dict[str, str]:
+    _run_fk_index_ddl(
+        f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {FK_COMPOSITE_INDEX_NAME} ON todos (user_id, completed, created_at DESC)"
+    )
+    return {"status": "ok"}
+
+
+@app.get("/fk-index/explain")
+def fk_index_explain(
+    request: Request,
+    user_id: int = Query(..., ge=1),
+    completed_only: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    sql = _fk_join_sql(completed_only=completed_only)
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+    plan_rows = db.execute(
+        text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {sql}"),
+        {"user_id": user_id, "limit": limit},
+    ).fetchall()
+    payload = {
+        "user_id": user_id,
+        "completed_only": completed_only,
+        "limit": limit,
+        "plan": [row[0] for row in plan_rows],
+    }
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
+    return payload
+
+
+@app.get("/fk-index/join")
+def fk_index_join(
+    request: Request,
+    user_id: int = Query(..., ge=1),
+    completed_only: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    sql = _fk_join_sql(completed_only=completed_only)
+    started_at = time.perf_counter()
+    rows = db.execute(text(sql), {"user_id": user_id, "limit": limit}).mappings().all()
+    db_ms = (time.perf_counter() - started_at) * 1000
+    db.info["query_count"] = db.info.get("query_count", 0) + 1
+    request.state.db_query_count = db.info["query_count"]
+    payload = {
+        "status": "ok",
+        "user_id": user_id,
+        "completed_only": completed_only,
+        "limit": limit,
+        "row_count": len(rows),
+        "db_ms": round(db_ms, 2),
+        "items": [dict(row) for row in rows[:10]],
+    }
+    request.state.response_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
+    logger.info(
+        "foreign key join completed",
+        extra={
+            "event": "fk_index_profile",
+            "extra_fields": {
+                "user_id": user_id,
+                "completed_only": completed_only,
+                "limit": limit,
+                "db_ms": round(db_ms, 2),
+                "row_count": len(rows),
+            },
+        },
+    )
+    return payload
 
 
 def _db_retry_status_payload() -> dict[str, float | int | str]:

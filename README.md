@@ -876,3 +876,124 @@ What should change:
 - after enough failures, the breaker state becomes `open`
 - requests fail fast instead of continuing to hit the degraded DB
 - the feedback loop is broken because retries stop
+
+## Production Battlefield Scenario 17
+
+Symptom:
+
+- a join on `todos.user_id` is fine on small tables, then degrades hard once `todos` grows because the foreign key exists without an index
+
+Schema shape now included in the API startup path:
+
+- `users` table
+- `todos.user_id` foreign key to `users(id)`
+- `todos.completed` boolean for the composite-index comparison
+
+Important: the foreign key is created without an index on purpose.
+
+Recommended setup:
+
+1. Seed a larger todo table if needed:
+
+```bash
+cd apps/api
+PYTHONPATH=. python scripts/seed_todos.py --count 100000 --batch-size 1000
+```
+
+2. Seed users and assign existing todos to users:
+
+```bash
+PYTHONPATH=. python scripts/seed_todo_users.py --users 10000
+```
+
+3. Inspect current status:
+
+```bash
+curl "http://localhost:8000/fk-index/status"
+```
+
+4. Audit for missing FK indexes:
+
+```bash
+curl "http://localhost:8000/fk-index/audit"
+```
+
+This returns the exact `CREATE INDEX CONCURRENTLY` statements needed to fix any missing FK index.
+
+5. CI-style check:
+
+```bash
+PYTHONPATH=. python scripts/check_missing_fk_indexes.py
+```
+
+This exits non-zero if any foreign key is missing a supporting index.
+
+No-index path:
+
+1. Drop drill indexes:
+
+```bash
+curl -X POST "http://localhost:8000/fk-index/index/drop"
+```
+
+2. Inspect the plan:
+
+```bash
+curl "http://localhost:8000/fk-index/explain?user_id=1&limit=50"
+```
+
+What to look for:
+
+- `Seq Scan` on `todos`
+- a large number of rows removed by filter
+
+3. Load test it:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e MODE=no_index -e VUS=10 -e DURATION=20s load-tests/todos-fk-index.js
+```
+
+Basic index comparison:
+
+1. Create the FK index:
+
+```bash
+curl -X POST "http://localhost:8000/fk-index/index/basic"
+```
+
+2. Inspect the plan again:
+
+```bash
+curl "http://localhost:8000/fk-index/explain?user_id=1&limit=50"
+```
+
+What should change:
+
+- `Seq Scan` should become `Index Scan`
+- execution time should drop sharply
+
+3. Load test the indexed path:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e MODE=basic -e VUS=10 -e DURATION=20s load-tests/todos-fk-index.js
+```
+
+Composite index comparison:
+
+If your hot query is “this user’s incomplete todos ordered by newest first”, compare with:
+
+```bash
+curl -X POST "http://localhost:8000/fk-index/index/composite"
+curl "http://localhost:8000/fk-index/explain?user_id=1&completed_only=true&limit=50"
+```
+
+Then load test:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e MODE=composite -e COMPLETED_ONLY=true -e VUS=10 -e DURATION=20s load-tests/todos-fk-index.js
+```
+
+What should change:
+
+- the basic FK index removes the full-table scan
+- the composite index removes extra filtering/sorting work for the `(user_id, completed, created_at DESC)` pattern
