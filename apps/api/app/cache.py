@@ -14,6 +14,8 @@ from app.config import settings
 logger = logging.getLogger("app.cache")
 TODO_LIST_CACHE_KEY = "todos:list"
 TODO_LIST_CACHE_LOCK_KEY = f"{TODO_LIST_CACHE_KEY}:lock"
+STARTUP_TODO_WARM_LOCK_KEY = "startup:todos:warm:lock"
+STARTUP_TODO_WARM_DONE_KEY = "startup:todos:warm:done"
 
 redis_client = Redis.from_url(settings.redis_url, decode_responses=True) if settings.redis_url else None
 
@@ -56,7 +58,7 @@ def set_todo_list_cache(payload: list[dict], *, use_jitter: bool = False) -> Non
         redis_client.setex(
             TODO_LIST_CACHE_KEY,
             ttl,
-            json.dumps(payload),
+            json.dumps(payload, default=str),
         )
     except RedisError:
         logger.warning(
@@ -147,3 +149,93 @@ def wait_for_todo_list_cache() -> list[dict] | None:
             return cached
         time.sleep(settings.todo_cache_lock_poll_seconds)
     return None
+
+
+def acquire_startup_todo_warm_lock() -> str | None:
+    if redis_client is None:
+        return None
+
+    token = str(uuid.uuid4())
+    try:
+        acquired = redis_client.set(
+            STARTUP_TODO_WARM_LOCK_KEY,
+            token,
+            nx=True,
+            ex=max(1, int(settings.startup_warm_lock_timeout_seconds)),
+        )
+        return token if acquired else None
+    except RedisError:
+        return None
+
+
+def release_startup_todo_warm_lock(token: str) -> None:
+    if redis_client is None:
+        return
+
+    try:
+        current = redis_client.get(STARTUP_TODO_WARM_LOCK_KEY)
+        if current == token:
+            redis_client.delete(STARTUP_TODO_WARM_LOCK_KEY)
+    except RedisError:
+        logger.warning(
+            "startup warm lock release failed",
+            extra={
+                "event": "startup_warm_lock_release_failed",
+                "extra_fields": {
+                    "cache_key": STARTUP_TODO_WARM_LOCK_KEY,
+                },
+            },
+        )
+
+
+def mark_startup_todo_warm_done(payload: dict[str, str | int | float]) -> None:
+    if redis_client is None:
+        return
+
+    try:
+        redis_client.setex(
+            STARTUP_TODO_WARM_DONE_KEY,
+            max(60, int(settings.todo_cache_ttl_seconds)),
+            json.dumps(payload),
+        )
+    except RedisError:
+        logger.warning(
+            "startup warm done marker write failed",
+            extra={
+                "event": "startup_warm_done_write_failed",
+                "extra_fields": {
+                    "cache_key": STARTUP_TODO_WARM_DONE_KEY,
+                },
+            },
+        )
+
+
+def get_startup_todo_warm_done() -> dict | None:
+    if redis_client is None:
+        return None
+
+    try:
+        raw = redis_client.get(STARTUP_TODO_WARM_DONE_KEY)
+        if raw is None:
+            return None
+        return json.loads(raw)
+    except RedisError:
+        return None
+
+
+def clear_startup_todo_warm_state() -> None:
+    if redis_client is None:
+        return
+
+    try:
+        redis_client.delete(STARTUP_TODO_WARM_LOCK_KEY, STARTUP_TODO_WARM_DONE_KEY)
+    except RedisError:
+        logger.warning(
+            "startup warm state clear failed",
+            extra={
+                "event": "startup_warm_state_clear_failed",
+                "extra_fields": {
+                    "cache_key": STARTUP_TODO_WARM_DONE_KEY,
+                },
+            },
+        )

@@ -60,6 +60,7 @@ Useful env vars:
 - API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`
 - API: `DATABASE_URL`, `REDIS_URL`, `CORS_ORIGINS`, `TODO_READ_DELAY_SECONDS`, `TODO_CACHE_TTL_SECONDS`, `TODO_CACHE_TTL_JITTER_SECONDS`, `TODO_CACHE_LOCK_TIMEOUT_SECONDS`, `TODO_CACHE_LOCK_WAIT_TIMEOUT_SECONDS`, `TODO_CACHE_LOCK_POLL_SECONDS`, `TODO_CACHE_REBUILD_DELAY_SECONDS`, `TODO_UPSTREAM_URL`, `TODO_UPSTREAM_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`
 - API: `MIGRATION_READ_LOCK_TIMEOUT_SECONDS`, `MIGRATION_DANGEROUS_HOLD_SECONDS`, `MIGRATION_BACKFILL_BATCH_SIZE`, `MIGRATION_BACKFILL_PAUSE_SECONDS`, `MIGRATION_LOCK_TIMEOUT_SECONDS`
+- API: `STARTUP_WARM_MODE`, `STARTUP_WARM_DB_DELAY_SECONDS`, `STARTUP_WARM_QUERY_LIMIT`, `STARTUP_WARM_STAGGER_SECONDS`, `STARTUP_WARM_LOCK_TIMEOUT_SECONDS`, `STARTUP_WARM_WAIT_TIMEOUT_SECONDS`, `STARTUP_WARM_POLL_SECONDS`, `RAILWAY_REPLICAS`, `DB_CONNECTION_BUDGET`, `AUTO_TUNE_DB_POOL_FOR_REPLICAS`
 - Web: `NEXT_PUBLIC_API_BASE_URL`
 
 Recommended Railway values:
@@ -84,6 +85,16 @@ Recommended Railway values:
 - `MIGRATION_BACKFILL_BATCH_SIZE`: `5000`
 - `MIGRATION_BACKFILL_PAUSE_SECONDS`: `0.05`
 - `MIGRATION_LOCK_TIMEOUT_SECONDS`: `5`
+- `STARTUP_WARM_MODE`: `disabled` normally, `simultaneous`, `staggered`, `locked`, or `lazy` for the drill
+- `STARTUP_WARM_DB_DELAY_SECONDS`: `8` for a visible startup herd drill
+- `STARTUP_WARM_QUERY_LIMIT`: `5000`
+- `STARTUP_WARM_STAGGER_SECONDS`: `8`
+- `STARTUP_WARM_LOCK_TIMEOUT_SECONDS`: `30`
+- `STARTUP_WARM_WAIT_TIMEOUT_SECONDS`: `45`
+- `STARTUP_WARM_POLL_SECONDS`: `0.2`
+- `RAILWAY_REPLICAS`: set this to your replica count when auto-tuning pool size
+- `DB_CONNECTION_BUDGET`: `25` for Railway free-tier Postgres
+- `AUTO_TUNE_DB_POOL_FOR_REPLICAS`: `true` to cap per-replica pool size automatically
 - `NEXT_PUBLIC_API_BASE_URL`: `https://<your-api-domain>`
 
 Railway config files:
@@ -997,3 +1008,132 @@ What should change:
 
 - the basic FK index removes the full-table scan
 - the composite index removes extra filtering/sorting work for the `(user_id, completed, created_at DESC)` pattern
+
+## Production Battlefield Scenario 18
+
+Symptom:
+
+- a deploy starts multiple replicas
+- each replica runs the same expensive startup warm query
+- database load spikes at deploy time instead of request time
+
+Important mental model:
+
+- everything inside FastAPI startup runs once per process
+- with 4 replicas, a startup warm query runs 4 times unless you deliberately stop it
+
+Useful endpoints:
+
+```bash
+curl "http://localhost:8000/health"
+curl "http://localhost:8000/ready"
+curl "http://localhost:8000/startup-herd/status"
+```
+
+`/health` answers “is this process alive?”
+
+`/ready` answers “has startup warming completed for this process?”
+
+Dangerous startup mode:
+
+Set these on Railway API:
+
+```text
+STARTUP_WARM_MODE=simultaneous
+STARTUP_WARM_DB_DELAY_SECONDS=8
+STARTUP_WARM_QUERY_LIMIT=5000
+```
+
+Scale the API service to 4 replicas and deploy.
+
+What happens:
+
+- each replica blocks in startup
+- each replica opens a DB connection and runs the same expensive warm query
+- startup DB cost becomes proportional to replica count
+
+Staggered comparison:
+
+```text
+STARTUP_WARM_MODE=staggered
+STARTUP_WARM_DB_DELAY_SECONDS=8
+STARTUP_WARM_STAGGER_SECONDS=8
+RAILWAY_REPLICAS=4
+```
+
+What changes:
+
+- replicas sleep for a deterministic stagger before warming
+- only one replica is likely warming at a time
+- DB load is spread across time rather than spiking at deploy
+
+Distributed lock comparison:
+
+Requires Redis.
+
+```text
+STARTUP_WARM_MODE=locked
+STARTUP_WARM_DB_DELAY_SECONDS=8
+STARTUP_WARM_QUERY_LIMIT=5000
+STARTUP_WARM_LOCK_TIMEOUT_SECONDS=30
+STARTUP_WARM_WAIT_TIMEOUT_SECONDS=45
+STARTUP_WARM_POLL_SECONDS=0.2
+```
+
+What changes:
+
+- one replica wins the Redis lock
+- that replica warms the todo cache
+- the other replicas wait for the shared warm marker or shared cache and skip the DB query
+- startup DB cost becomes roughly constant rather than N-per-replica
+
+Lazy init comparison:
+
+```text
+STARTUP_WARM_MODE=lazy
+STARTUP_WARM_DB_DELAY_SECONDS=8
+STARTUP_WARM_QUERY_LIMIT=5000
+```
+
+What changes:
+
+- deploy finishes quickly because startup does not hit the DB
+- `/health` returns `200` immediately
+- `/ready` stays `503` until the first `/todos` request performs the warm
+
+Trigger the first-request warm with:
+
+```bash
+curl "http://localhost:8000/todos"
+```
+
+Or manually trigger the warm path:
+
+```bash
+curl -X POST "http://localhost:8000/startup-herd/trigger?mode=lazy"
+```
+
+Reset shared warm state between experiments:
+
+```bash
+curl -X POST "http://localhost:8000/startup-herd/reset"
+```
+
+Pool sizing safety net:
+
+If you run 4 replicas with a fixed `DB_POOL_SIZE=10`, your theoretical pool demand is `4 * 10 = 40`, which can exceed a small Postgres plan.
+
+Enable auto-tuning:
+
+```text
+RAILWAY_REPLICAS=4
+DB_CONNECTION_BUDGET=25
+AUTO_TUNE_DB_POOL_FOR_REPLICAS=true
+```
+
+What should change:
+
+- simultaneous mode makes deploy-time DB work proportional to replica count
+- staggered mode spreads startup DB load out
+- locked mode makes only one replica pay the startup DB cost
+- lazy mode removes startup DB load entirely and shifts it to first request

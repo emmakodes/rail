@@ -30,6 +30,16 @@ class Settings:
     migration_backfill_batch_size = int(os.getenv("MIGRATION_BACKFILL_BATCH_SIZE", "5000"))
     migration_backfill_pause_seconds = float(os.getenv("MIGRATION_BACKFILL_PAUSE_SECONDS", "0.05"))
     migration_lock_timeout_seconds = float(os.getenv("MIGRATION_LOCK_TIMEOUT_SECONDS", "5"))
+    startup_warm_mode = os.getenv("STARTUP_WARM_MODE", "disabled")
+    startup_warm_db_delay_seconds = float(os.getenv("STARTUP_WARM_DB_DELAY_SECONDS", "0"))
+    startup_warm_query_limit = int(os.getenv("STARTUP_WARM_QUERY_LIMIT", "5000"))
+    startup_warm_stagger_seconds = float(os.getenv("STARTUP_WARM_STAGGER_SECONDS", "0"))
+    startup_warm_lock_timeout_seconds = float(os.getenv("STARTUP_WARM_LOCK_TIMEOUT_SECONDS", "30"))
+    startup_warm_wait_timeout_seconds = float(os.getenv("STARTUP_WARM_WAIT_TIMEOUT_SECONDS", "45"))
+    startup_warm_poll_seconds = float(os.getenv("STARTUP_WARM_POLL_SECONDS", "0.2"))
+    railway_replicas = int(os.getenv("RAILWAY_REPLICAS", "1"))
+    db_connection_budget = int(os.getenv("DB_CONNECTION_BUDGET", "25"))
+    auto_tune_db_pool_for_replicas = os.getenv("AUTO_TUNE_DB_POOL_FOR_REPLICAS", "false").lower() == "true"
     db_pool_size = int(os.getenv("DB_POOL_SIZE", "5"))
     db_max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "10"))
     db_pool_timeout_seconds = float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "30"))
@@ -51,6 +61,19 @@ class Settings:
         if self.database_url.startswith("postgres://"):
             return self.database_url.replace("postgres://", "postgresql+psycopg://", 1)
         return self.database_url
+
+    @property
+    def effective_db_pool_size(self) -> int:
+        if not self.auto_tune_db_pool_for_replicas:
+            return self.db_pool_size
+        per_replica_budget = max(1, self.db_connection_budget // max(1, self.railway_replicas))
+        return max(1, min(self.db_pool_size, per_replica_budget))
+
+    @property
+    def effective_db_max_overflow(self) -> int:
+        if not self.auto_tune_db_pool_for_replicas:
+            return self.db_max_overflow
+        return 0
 
 
 settings = Settings()

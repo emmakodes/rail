@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 import tracemalloc
@@ -24,10 +25,16 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.cache import (
     acquire_todo_list_cache_lock,
+    acquire_startup_todo_warm_lock,
+    clear_startup_todo_warm_state,
     get_todo_list_cache,
     get_todo_list_cache_ttl,
+    get_startup_todo_warm_done,
     invalidate_todo_list_cache,
+    mark_startup_todo_warm_done,
+    redis_client,
     release_todo_list_cache_lock,
+    release_startup_todo_warm_lock,
     set_todo_list_cache,
     wait_for_todo_list_cache,
 )
@@ -102,6 +109,27 @@ class MigrationDrillState:
 MIGRATION_DRILL_STATE = MigrationDrillState()
 MIGRATION_DRILL_STATE_LOCK = threading.Lock()
 
+
+@dataclass
+class StartupWarmState:
+    mode: str = "disabled"
+    stage: str = "disabled"
+    ready: bool = True
+    instance_id: str = os.getenv("HOSTNAME", f"pid-{os.getpid()}")
+    pid: int = os.getpid()
+    warm_started_at_epoch: float = 0
+    warm_completed_at_epoch: float = 0
+    warm_db_ms: float = 0
+    warm_row_count: int = 0
+    last_error: str | None = None
+    used_distributed_lock: bool = False
+    won_distributed_lock: bool = False
+
+
+STARTUP_WARM_STATE = StartupWarmState()
+STARTUP_WARM_STATE_LOCK = threading.Lock()
+STARTUP_WARM_TASK: asyncio.Task | None = None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.parsed_cors_origins,
@@ -118,6 +146,31 @@ async def on_startup() -> None:
     global MEMORY_BASELINE_SNAPSHOT
     MEMORY_BASELINE_SNAPSHOT = tracemalloc.take_snapshot()
     asyncio.create_task(monitor_event_loop_lag())
+    _update_startup_warm_state(
+        mode=settings.startup_warm_mode,
+        stage="disabled" if settings.startup_warm_mode == "disabled" else "startup_pending",
+        ready=settings.startup_warm_mode == "disabled",
+        warm_started_at_epoch=0,
+        warm_completed_at_epoch=0,
+        warm_db_ms=0,
+        warm_row_count=0,
+        last_error=None,
+        used_distributed_lock=False,
+        won_distributed_lock=False,
+    )
+    if settings.startup_warm_mode == "simultaneous":
+        await _perform_startup_todo_warm("startup_simultaneous", use_lock=False)
+    elif settings.startup_warm_mode == "staggered":
+        delay_seconds = _startup_stagger_delay_seconds()
+        if delay_seconds > 0:
+            _update_startup_warm_state(stage="startup_stagger_sleep")
+            await asyncio.sleep(delay_seconds)
+        await _perform_startup_todo_warm("startup_staggered", use_lock=False)
+    elif settings.startup_warm_mode == "locked":
+        _update_startup_warm_state(stage="deferred_lock_pending", ready=False)
+        _ensure_startup_warm_task("locked", "startup_locked")
+    elif settings.startup_warm_mode == "lazy":
+        _update_startup_warm_state(stage="lazy_pending", ready=False)
 
 
 @app.middleware("http")
@@ -128,6 +181,13 @@ async def observability_middleware(request, call_next):
 @app.get("/health")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness() -> Response:
+    payload = _startup_warm_status_payload()
+    status_code = status.HTTP_200_OK if bool(payload["ready"]) else status.HTTP_503_SERVICE_UNAVAILABLE
+    return Response(content=json.dumps(payload, default=str), media_type="application/json", status_code=status_code)
 
 
 @app.get("/metrics", include_in_schema=False)
@@ -396,6 +456,174 @@ def _start_migration_thread(target: callable, *, mode: str) -> None:
             )
     thread = threading.Thread(target=target, name=f"migration-drill-{mode}", daemon=True)
     thread.start()
+
+
+def _startup_warm_status_payload() -> dict[str, object]:
+    with STARTUP_WARM_STATE_LOCK:
+        return {
+            "mode": STARTUP_WARM_STATE.mode,
+            "stage": STARTUP_WARM_STATE.stage,
+            "ready": STARTUP_WARM_STATE.ready,
+            "instance_id": STARTUP_WARM_STATE.instance_id,
+            "pid": STARTUP_WARM_STATE.pid,
+            "warm_started_at_epoch": round(STARTUP_WARM_STATE.warm_started_at_epoch, 2),
+            "warm_completed_at_epoch": round(STARTUP_WARM_STATE.warm_completed_at_epoch, 2),
+            "warm_db_ms": round(STARTUP_WARM_STATE.warm_db_ms, 2),
+            "warm_row_count": STARTUP_WARM_STATE.warm_row_count,
+            "last_error": STARTUP_WARM_STATE.last_error,
+            "used_distributed_lock": STARTUP_WARM_STATE.used_distributed_lock,
+            "won_distributed_lock": STARTUP_WARM_STATE.won_distributed_lock,
+            "shared_warm_marker": get_startup_todo_warm_done(),
+            "cache_present": get_todo_list_cache_ttl() not in (None, -2),
+            "cache_ttl_seconds": get_todo_list_cache_ttl(),
+            "replica_count": settings.railway_replicas,
+            "effective_db_pool_size": settings.effective_db_pool_size,
+            "effective_db_max_overflow": settings.effective_db_max_overflow,
+        }
+
+
+def _update_startup_warm_state(**changes: object) -> None:
+    with STARTUP_WARM_STATE_LOCK:
+        for key, value in changes.items():
+            setattr(STARTUP_WARM_STATE, key, value)
+
+
+def _startup_stagger_delay_seconds() -> float:
+    if settings.startup_warm_stagger_seconds <= 0 or settings.railway_replicas <= 1:
+        return 0
+    stable_hash = int(hashlib.sha256(STARTUP_WARM_STATE.instance_id.encode("utf-8")).hexdigest(), 16)
+    slot = stable_hash % max(1, settings.railway_replicas)
+    return round(slot * settings.startup_warm_stagger_seconds, 2)
+
+
+def _run_startup_todo_warm_query(trigger: str) -> tuple[int, float]:
+    db = SessionLocal()
+    try:
+        started_at = time.perf_counter()
+        if settings.startup_warm_db_delay_seconds > 0:
+            db.execute(
+                text("SELECT pg_sleep(:delay_seconds)"),
+                {"delay_seconds": settings.startup_warm_db_delay_seconds},
+            )
+        rows = db.execute(
+            text(
+                """
+                SELECT id, title, created_at
+                FROM todos
+                ORDER BY id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": settings.startup_warm_query_limit},
+        ).mappings().all()
+        payload = [dict(row) for row in rows]
+        set_todo_list_cache(payload, use_jitter=True)
+        db_ms = (time.perf_counter() - started_at) * 1000
+        logger.info(
+            "startup warm query completed",
+            extra={
+                "event": "startup_warm",
+                "extra_fields": {
+                    "trigger": trigger,
+                    "mode": STARTUP_WARM_STATE.mode,
+                    "instance_id": STARTUP_WARM_STATE.instance_id,
+                    "row_count": len(payload),
+                    "db_ms": round(db_ms, 2),
+                },
+            },
+        )
+        return len(payload), db_ms
+    finally:
+        db.close()
+
+
+async def _perform_startup_todo_warm(trigger: str, *, use_lock: bool) -> None:
+    lock_token: str | None = None
+    if use_lock and redis_client is None:
+        use_lock = False
+    _update_startup_warm_state(
+        warm_started_at_epoch=time.time(),
+        stage="warming",
+        ready=False,
+        last_error=None,
+        used_distributed_lock=use_lock,
+        won_distributed_lock=False,
+    )
+    try:
+        if use_lock:
+            _update_startup_warm_state(stage="acquiring_distributed_lock")
+            lock_token = acquire_startup_todo_warm_lock()
+            if lock_token is None:
+                _update_startup_warm_state(stage="waiting_for_shared_warm")
+                deadline = time.perf_counter() + settings.startup_warm_wait_timeout_seconds
+                while time.perf_counter() < deadline:
+                    if get_startup_todo_warm_done() is not None or get_todo_list_cache() is not None:
+                        _update_startup_warm_state(
+                            stage="shared_warm_ready",
+                            ready=True,
+                            warm_completed_at_epoch=time.time(),
+                        )
+                        return
+                    await asyncio.sleep(settings.startup_warm_poll_seconds)
+                raise RuntimeError("Timed out waiting for another replica to finish startup warm")
+
+            _update_startup_warm_state(stage="warming", won_distributed_lock=True)
+
+        row_count, db_ms = _run_startup_todo_warm_query(trigger)
+        mark_startup_todo_warm_done(
+            {
+                "instance_id": STARTUP_WARM_STATE.instance_id,
+                "trigger": trigger,
+                "completed_at_epoch": round(time.time(), 2),
+                "row_count": row_count,
+                "db_ms": round(db_ms, 2),
+            }
+        )
+        _update_startup_warm_state(
+            stage="completed",
+            ready=True,
+            warm_completed_at_epoch=time.time(),
+            warm_row_count=row_count,
+            warm_db_ms=db_ms,
+        )
+    except Exception as exc:
+        logger.exception(
+            "startup warm failed",
+            extra={
+                "event": "startup_warm",
+                "extra_fields": {
+                    "trigger": trigger,
+                    "mode": STARTUP_WARM_STATE.mode,
+                    "instance_id": STARTUP_WARM_STATE.instance_id,
+                    "stage": STARTUP_WARM_STATE.stage,
+                },
+            },
+        )
+        _update_startup_warm_state(
+            stage="failed",
+            last_error=str(exc),
+            ready=False,
+            warm_completed_at_epoch=time.time(),
+        )
+    finally:
+        if lock_token is not None:
+            release_startup_todo_warm_lock(lock_token)
+
+
+async def _run_deferred_startup_todo_warm(mode: str, trigger: str) -> None:
+    delay_seconds = _startup_stagger_delay_seconds() if mode == "locked" else 0
+    if delay_seconds > 0:
+        _update_startup_warm_state(stage="deferred_stagger")
+        await asyncio.sleep(delay_seconds)
+    await _perform_startup_todo_warm(trigger, use_lock=(mode == "locked"))
+
+
+def _ensure_startup_warm_task(mode: str, trigger: str) -> None:
+    global STARTUP_WARM_TASK
+    if STARTUP_WARM_TASK is not None and not STARTUP_WARM_TASK.done():
+        return
+    loop = asyncio.get_running_loop()
+    STARTUP_WARM_TASK = loop.create_task(_run_deferred_startup_todo_warm(mode, trigger))
 
 
 def _fk_index_status_payload(db: Session) -> dict[str, object]:
@@ -817,6 +1045,51 @@ def fk_index_join(
         },
     )
     return payload
+
+
+@app.get("/startup-herd/status")
+def startup_herd_status() -> dict[str, object]:
+    return _startup_warm_status_payload()
+
+
+@app.post("/startup-herd/reset")
+def startup_herd_reset() -> dict[str, object]:
+    global STARTUP_WARM_TASK
+    if STARTUP_WARM_TASK is not None and not STARTUP_WARM_TASK.done():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot reset while startup warm task is still running",
+        )
+    invalidate_todo_list_cache()
+    clear_startup_todo_warm_state()
+    _update_startup_warm_state(
+        stage="lazy_pending" if settings.startup_warm_mode == "lazy" else "startup_pending",
+        ready=settings.startup_warm_mode == "disabled",
+        warm_started_at_epoch=0,
+        warm_completed_at_epoch=0,
+        warm_db_ms=0,
+        warm_row_count=0,
+        last_error=None,
+        used_distributed_lock=False,
+        won_distributed_lock=False,
+    )
+    STARTUP_WARM_TASK = None
+    return _startup_warm_status_payload()
+
+
+@app.post("/startup-herd/trigger")
+async def startup_herd_trigger(mode: str = Query(default="simultaneous", pattern="^(simultaneous|staggered|locked|lazy)$")) -> dict[str, object]:
+    if mode == "staggered":
+        delay_seconds = _startup_stagger_delay_seconds()
+        if delay_seconds > 0:
+            _update_startup_warm_state(stage="manual_stagger_sleep", ready=False)
+            await asyncio.sleep(delay_seconds)
+        await _perform_startup_todo_warm("manual_staggered", use_lock=False)
+    elif mode == "locked":
+        await _perform_startup_todo_warm("manual_locked", use_lock=True)
+    else:
+        await _perform_startup_todo_warm(f"manual_{mode}", use_lock=False)
+    return _startup_warm_status_payload()
 
 
 def _db_retry_status_payload() -> dict[str, float | int | str]:
@@ -1246,6 +1519,9 @@ async def list_todos(
     offset: int = Query(default=0, ge=0, le=5000),
     db: Session = Depends(get_db),
 ) -> list[Todo] | list[dict]:
+    if settings.startup_warm_mode == "lazy" and STARTUP_WARM_STATE.ready is False:
+        await _perform_startup_todo_warm("lazy_first_request", use_lock=False)
+
     def count_query() -> None:
         db.info["query_count"] = db.info.get("query_count", 0) + 1
         request.state.db_query_count = db.info["query_count"]
