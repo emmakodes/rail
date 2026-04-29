@@ -1137,3 +1137,74 @@ What should change:
 - staggered mode spreads startup DB load out
 - locked mode makes only one replica pay the startup DB cost
 - lazy mode removes startup DB load entirely and shifts it to first request
+
+## Production Battlefield Scenario 19
+
+Symptom:
+
+- one CPU-heavy request makes unrelated fast endpoints stall
+
+Injection:
+
+1. Hit the intentionally broken CPU endpoint:
+
+```bash
+curl "http://localhost:8000/cpu/blocking?iterations=10000000"
+```
+
+This endpoint is declared `async`, but it performs a pure Python loop directly on the event loop thread.
+
+2. Compare with the fast endpoint:
+
+```bash
+curl "http://localhost:8000/cpu/fast"
+```
+
+3. Run the mixed load test:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e CPU_PATH=/cpu/blocking -e CPU_ITERATIONS=10000000 -e CPU_VUS=2 -e FAST_VUS=5 -e DURATION=20s load-tests/todos-cpu-bound.js
+```
+
+What to observe:
+
+- `GET /cpu/fast` becomes slow even though it does no CPU work
+- Railway logs should show event loop lag warnings
+- one request can monopolize the single event loop thread
+
+Thread-pool comparison:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e CPU_PATH=/cpu/threaded -e CPU_ITERATIONS=10000000 -e CPU_VUS=2 -e FAST_VUS=5 -e DURATION=20s load-tests/todos-cpu-bound.js
+```
+
+What changes:
+
+- the CPU work moves off the event loop thread
+- fast requests should stop freezing completely
+- but latency can still stay higher than ideal because Python threads still contend on the GIL
+
+Process-pool comparison:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e CPU_PATH=/cpu/process -e CPU_ITERATIONS=10000000 -e CPU_VUS=2 -e FAST_VUS=5 -e DURATION=20s load-tests/todos-cpu-bound.js
+```
+
+What changes:
+
+- CPU work moves into separate worker processes
+- the event loop stays mostly free to serve `GET /cpu/fast`
+- this is the best fit for pure Python CPU-bound work
+
+Optional parallelism check:
+
+Set `CPU_JOBS` above `1` to submit multiple CPU jobs at once. The threaded and process endpoints use `asyncio.gather()` to hand all jobs to the executor together.
+
+Useful env vars:
+
+```text
+CPU_BURN_ITERATIONS=10000000
+CPU_PARALLEL_JOBS=1
+CPU_THREAD_POOL_WORKERS=4
+CPU_PROCESS_POOL_WORKERS=2
+```

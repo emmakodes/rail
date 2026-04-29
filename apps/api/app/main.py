@@ -7,6 +7,7 @@ import threading
 import time
 import tracemalloc
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 
@@ -129,6 +130,9 @@ class StartupWarmState:
 STARTUP_WARM_STATE = StartupWarmState()
 STARTUP_WARM_STATE_LOCK = threading.Lock()
 STARTUP_WARM_TASK: asyncio.Task | None = None
+CPU_EXECUTOR_LOCK = threading.Lock()
+CPU_THREAD_POOL: ThreadPoolExecutor | None = None
+CPU_PROCESS_POOL: ProcessPoolExecutor | None = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -171,6 +175,17 @@ async def on_startup() -> None:
         _ensure_startup_warm_task("locked", "startup_locked")
     elif settings.startup_warm_mode == "lazy":
         _update_startup_warm_state(stage="lazy_pending", ready=False)
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    global CPU_THREAD_POOL, CPU_PROCESS_POOL
+    if CPU_THREAD_POOL is not None:
+        CPU_THREAD_POOL.shutdown(wait=False, cancel_futures=True)
+        CPU_THREAD_POOL = None
+    if CPU_PROCESS_POOL is not None:
+        CPU_PROCESS_POOL.shutdown(wait=False, cancel_futures=True)
+        CPU_PROCESS_POOL = None
 
 
 @app.middleware("http")
@@ -228,6 +243,60 @@ def _add_serialization_headers(
     response.headers["x-pydantic-ms"] = str(round(pydantic_ms, 2))
     response.headers["x-json-encode-ms"] = str(round(json_encode_ms, 2))
     response.headers["x-response-bytes"] = str(response_bytes)
+
+
+def _cpu_spin(iterations: int, job_seed: int) -> int:
+    checksum = 0
+    for index in range(iterations):
+        checksum = (checksum + ((index ^ job_seed) % 97)) % 1_000_000_007
+    return checksum
+
+
+def _get_cpu_thread_pool() -> ThreadPoolExecutor:
+    global CPU_THREAD_POOL
+    if CPU_THREAD_POOL is None:
+        with CPU_EXECUTOR_LOCK:
+            if CPU_THREAD_POOL is None:
+                CPU_THREAD_POOL = ThreadPoolExecutor(
+                    max_workers=settings.cpu_thread_pool_workers,
+                    thread_name_prefix="cpu-burn",
+                )
+    return CPU_THREAD_POOL
+
+
+def _get_cpu_process_pool() -> ProcessPoolExecutor:
+    global CPU_PROCESS_POOL
+    if CPU_PROCESS_POOL is None:
+        with CPU_EXECUTOR_LOCK:
+            if CPU_PROCESS_POOL is None:
+                CPU_PROCESS_POOL = ProcessPoolExecutor(max_workers=settings.cpu_process_pool_workers)
+    return CPU_PROCESS_POOL
+
+
+async def _run_cpu_jobs_in_executor(
+    *,
+    executor_kind: str,
+    iterations: int,
+    jobs: int,
+) -> dict[str, str | int | float]:
+    loop = asyncio.get_running_loop()
+    executor = _get_cpu_process_pool() if executor_kind == "process" else _get_cpu_thread_pool()
+    started_at = time.perf_counter()
+    checksums = await asyncio.gather(
+        *[
+            loop.run_in_executor(executor, _cpu_spin, iterations, job_index + 1)
+            for job_index in range(jobs)
+        ]
+    )
+    compute_ms = (time.perf_counter() - started_at) * 1000
+    return {
+        "status": "ok",
+        "executor": executor_kind,
+        "iterations": iterations,
+        "jobs": jobs,
+        "compute_ms": round(compute_ms, 2),
+        "checksum": sum(checksums) % 1_000_000_007,
+    }
 
 
 def _migration_status_payload() -> dict[str, float | int | str | bool | None]:
@@ -1375,6 +1444,46 @@ async def loop_blocking_fixed(
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, partial(time.sleep, block_seconds))
     return {"status": "ok", "block_seconds": block_seconds}
+
+
+@app.get("/cpu/fast")
+async def cpu_fast() -> dict[str, str]:
+    await asyncio.sleep(0.01)
+    return {"status": "ok"}
+
+
+@app.get("/cpu/blocking")
+async def cpu_blocking(
+    iterations: int = Query(default=settings.cpu_burn_iterations, ge=100_000, le=100_000_000),
+    jobs: int = Query(default=settings.cpu_parallel_jobs, ge=1, le=32),
+) -> dict[str, str | int | float]:
+    started_at = time.perf_counter()
+    checksums = [_cpu_spin(iterations, job_index + 1) for job_index in range(jobs)]
+    compute_ms = (time.perf_counter() - started_at) * 1000
+    return {
+        "status": "ok",
+        "executor": "event_loop",
+        "iterations": iterations,
+        "jobs": jobs,
+        "compute_ms": round(compute_ms, 2),
+        "checksum": sum(checksums) % 1_000_000_007,
+    }
+
+
+@app.get("/cpu/threaded")
+async def cpu_threaded(
+    iterations: int = Query(default=settings.cpu_burn_iterations, ge=100_000, le=100_000_000),
+    jobs: int = Query(default=settings.cpu_parallel_jobs, ge=1, le=32),
+) -> dict[str, str | int | float]:
+    return await _run_cpu_jobs_in_executor(executor_kind="thread", iterations=iterations, jobs=jobs)
+
+
+@app.get("/cpu/process")
+async def cpu_process(
+    iterations: int = Query(default=settings.cpu_burn_iterations, ge=100_000, le=100_000_000),
+    jobs: int = Query(default=settings.cpu_parallel_jobs, ge=1, le=32),
+) -> dict[str, str | int | float]:
+    return await _run_cpu_jobs_in_executor(executor_kind="process", iterations=iterations, jobs=jobs)
 
 
 @app.get("/pool/status")

@@ -37,6 +37,10 @@ class Settings:
     startup_warm_lock_timeout_seconds = float(os.getenv("STARTUP_WARM_LOCK_TIMEOUT_SECONDS", "30"))
     startup_warm_wait_timeout_seconds = float(os.getenv("STARTUP_WARM_WAIT_TIMEOUT_SECONDS", "45"))
     startup_warm_poll_seconds = float(os.getenv("STARTUP_WARM_POLL_SECONDS", "0.2"))
+    cpu_burn_iterations = int(os.getenv("CPU_BURN_ITERATIONS", "10000000"))
+    cpu_parallel_jobs = int(os.getenv("CPU_PARALLEL_JOBS", "1"))
+    cpu_thread_pool_workers = int(os.getenv("CPU_THREAD_POOL_WORKERS", "4"))
+    cpu_process_pool_workers = int(os.getenv("CPU_PROCESS_POOL_WORKERS", "2"))
     railway_replicas = int(os.getenv("RAILWAY_REPLICAS", "1"))
     db_connection_budget = int(os.getenv("DB_CONNECTION_BUDGET", "25"))
     auto_tune_db_pool_for_replicas = os.getenv("AUTO_TUNE_DB_POOL_FOR_REPLICAS", "false").lower() == "true"
