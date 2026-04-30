@@ -41,6 +41,8 @@ class Settings:
     cpu_parallel_jobs = int(os.getenv("CPU_PARALLEL_JOBS", "1"))
     cpu_thread_pool_workers = int(os.getenv("CPU_THREAD_POOL_WORKERS", "4"))
     cpu_process_pool_workers = int(os.getenv("CPU_PROCESS_POOL_WORKERS", "2"))
+    deadlock_hold_seconds = float(os.getenv("DEADLOCK_HOLD_SECONDS", "0.5"))
+    deadlock_detector_milliseconds = int(os.getenv("DEADLOCK_DETECTOR_MILLISECONDS", "200"))
     railway_replicas = int(os.getenv("RAILWAY_REPLICAS", "1"))
     db_connection_budget = int(os.getenv("DB_CONNECTION_BUDGET", "25"))
     auto_tune_db_pool_for_replicas = os.getenv("AUTO_TUNE_DB_POOL_FOR_REPLICAS", "false").lower() == "true"

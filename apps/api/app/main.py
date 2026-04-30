@@ -19,7 +19,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Body, Request
 from fastapi.responses import Response
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, selectinload
@@ -133,6 +133,21 @@ STARTUP_WARM_TASK: asyncio.Task | None = None
 CPU_EXECUTOR_LOCK = threading.Lock()
 CPU_THREAD_POOL: ThreadPoolExecutor | None = None
 CPU_PROCESS_POOL: ProcessPoolExecutor | None = None
+DEADLOCK_TARGET_TITLES = ("deadlock target a", "deadlock target b")
+
+
+@dataclass
+class DeadlockDrillState:
+    last_mode: str = "idle"
+    success_count: int = 0
+    deadlock_count: int = 0
+    last_error: str | None = None
+    last_order: list[int] | None = None
+    last_completed_value: bool = False
+
+
+DEADLOCK_DRILL_STATE = DeadlockDrillState()
+DEADLOCK_DRILL_STATE_LOCK = threading.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -296,6 +311,166 @@ async def _run_cpu_jobs_in_executor(
         "jobs": jobs,
         "compute_ms": round(compute_ms, 2),
         "checksum": sum(checksums) % 1_000_000_007,
+    }
+
+
+def _update_deadlock_state(**changes: object) -> None:
+    with DEADLOCK_DRILL_STATE_LOCK:
+        for key, value in changes.items():
+            setattr(DEADLOCK_DRILL_STATE, key, value)
+
+
+def _bump_deadlock_counters(*, success: bool, error: str | None, order: list[int], completed: bool) -> None:
+    with DEADLOCK_DRILL_STATE_LOCK:
+        if success:
+            DEADLOCK_DRILL_STATE.success_count += 1
+        else:
+            DEADLOCK_DRILL_STATE.deadlock_count += 1
+        DEADLOCK_DRILL_STATE.last_error = error
+        DEADLOCK_DRILL_STATE.last_order = order
+        DEADLOCK_DRILL_STATE.last_completed_value = completed
+
+
+def _deadlock_status_payload() -> dict[str, object]:
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT id, title, completed, created_at
+                FROM todos
+                WHERE title IN :titles
+                ORDER BY id
+                """
+            ).bindparams(bindparam("titles", expanding=True)),
+            {"titles": list(DEADLOCK_TARGET_TITLES)},
+        ).mappings().all()
+    with DEADLOCK_DRILL_STATE_LOCK:
+        return {
+            "targets": [dict(row) for row in rows],
+            "last_mode": DEADLOCK_DRILL_STATE.last_mode,
+            "success_count": DEADLOCK_DRILL_STATE.success_count,
+            "deadlock_count": DEADLOCK_DRILL_STATE.deadlock_count,
+            "last_error": DEADLOCK_DRILL_STATE.last_error,
+            "last_order": DEADLOCK_DRILL_STATE.last_order,
+            "last_completed_value": DEADLOCK_DRILL_STATE.last_completed_value,
+        }
+
+
+def _ensure_deadlock_targets() -> list[int]:
+    target_ids: list[int] = []
+    with engine.begin() as connection:
+        for title in DEADLOCK_TARGET_TITLES:
+            todo_id = connection.execute(
+                text("SELECT id FROM todos WHERE title = :title ORDER BY id LIMIT 1"),
+                {"title": title},
+            ).scalar_one_or_none()
+            if todo_id is None:
+                todo_id = connection.execute(
+                    text("INSERT INTO todos (title) VALUES (:title) RETURNING id"),
+                    {"title": title},
+                ).scalar_one()
+            target_ids.append(int(todo_id))
+    return target_ids
+
+
+def _resolve_deadlock_ids(first_id: int | None, second_id: int | None) -> list[int]:
+    if first_id is not None and second_id is not None:
+        if first_id == second_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="first_id and second_id must be different",
+            )
+        return [first_id, second_id]
+    return _ensure_deadlock_targets()
+
+
+def _lock_and_update_todos_in_order(
+    *,
+    order_ids: list[int],
+    completed: bool,
+    hold_seconds: float,
+) -> dict[str, object]:
+    db = SessionLocal()
+    started_at = time.perf_counter()
+    try:
+        with db.begin():
+            db.execute(
+                text(f"SET LOCAL deadlock_timeout = '{max(1, settings.deadlock_detector_milliseconds)}ms'")
+            )
+            for index, todo_id in enumerate(order_ids):
+                row_id = db.execute(
+                    text("SELECT id FROM todos WHERE id = :todo_id FOR UPDATE"),
+                    {"todo_id": todo_id},
+                ).scalar_one_or_none()
+                if row_id is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Todo {todo_id} not found",
+                    )
+                db.execute(
+                    text("UPDATE todos SET completed = :completed WHERE id = :todo_id"),
+                    {"completed": completed, "todo_id": todo_id},
+                )
+                if index == 0 and hold_seconds > 0:
+                    db.execute(text("SELECT pg_sleep(:hold_seconds)"), {"hold_seconds": hold_seconds})
+    except HTTPException:
+        raise
+    except OperationalError as exc:
+        message = str(exc).lower()
+        if "deadlock detected" in message:
+            _bump_deadlock_counters(
+                success=False,
+                error="deadlock detected",
+                order=order_ids,
+                completed=completed,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "deadlock detected",
+                    "order": order_ids,
+                },
+            ) from exc
+        raise
+    finally:
+        db.close()
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    _bump_deadlock_counters(success=True, error=None, order=order_ids, completed=completed)
+    return {
+        "status": "ok",
+        "order": order_ids,
+        "completed": completed,
+        "hold_seconds": hold_seconds,
+        "elapsed_ms": round(elapsed_ms, 2),
+    }
+
+
+def _batch_update_todos(
+    *,
+    todo_ids: list[int],
+    completed: bool,
+) -> dict[str, object]:
+    db = SessionLocal()
+    started_at = time.perf_counter()
+    try:
+        with db.begin():
+            result = db.execute(
+                text("UPDATE todos SET completed = :completed WHERE id IN :todo_ids")
+                .bindparams(bindparam("todo_ids", expanding=True)),
+                {"completed": completed, "todo_ids": todo_ids},
+            )
+    finally:
+        db.close()
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    _bump_deadlock_counters(success=True, error=None, order=todo_ids, completed=completed)
+    return {
+        "status": "ok",
+        "order": todo_ids,
+        "completed": completed,
+        "updated_rows": result.rowcount,
+        "elapsed_ms": round(elapsed_ms, 2),
     }
 
 
@@ -1002,6 +1177,90 @@ def migration_zero_downtime_read(
         "migration_mode": str(_migration_status_payload()["mode"]),
         "migration_step": str(_migration_status_payload()["step"]),
     }
+
+
+@app.get("/deadlock/status")
+def deadlock_status() -> dict[str, object]:
+    return _deadlock_status_payload()
+
+
+@app.post("/deadlock/reset")
+def deadlock_reset() -> dict[str, object]:
+    todo_ids = _ensure_deadlock_targets()
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE todos SET completed = false WHERE id IN :todo_ids").bindparams(
+                bindparam("todo_ids", expanding=True)
+            ),
+            {"todo_ids": todo_ids},
+        )
+    _update_deadlock_state(
+        last_mode="reset",
+        success_count=0,
+        deadlock_count=0,
+        last_error=None,
+        last_order=todo_ids,
+        last_completed_value=False,
+    )
+    return _deadlock_status_payload()
+
+
+@app.post("/deadlock/broken/forward")
+def deadlock_broken_forward(
+    first_id: int | None = Query(default=None, ge=1),
+    second_id: int | None = Query(default=None, ge=1),
+    completed: bool = Query(default=True),
+    hold_seconds: float = Query(default=settings.deadlock_hold_seconds, ge=0, le=5),
+) -> dict[str, object]:
+    order_ids = _resolve_deadlock_ids(first_id, second_id)
+    _update_deadlock_state(last_mode="broken_forward")
+    return _lock_and_update_todos_in_order(order_ids=order_ids, completed=completed, hold_seconds=hold_seconds)
+
+
+@app.post("/deadlock/broken/reverse")
+def deadlock_broken_reverse(
+    first_id: int | None = Query(default=None, ge=1),
+    second_id: int | None = Query(default=None, ge=1),
+    completed: bool = Query(default=True),
+    hold_seconds: float = Query(default=settings.deadlock_hold_seconds, ge=0, le=5),
+) -> dict[str, object]:
+    order_ids = list(reversed(_resolve_deadlock_ids(first_id, second_id)))
+    _update_deadlock_state(last_mode="broken_reverse")
+    return _lock_and_update_todos_in_order(order_ids=order_ids, completed=completed, hold_seconds=hold_seconds)
+
+
+@app.post("/deadlock/fixed/sorted")
+def deadlock_fixed_sorted(
+    first_id: int | None = Query(default=None, ge=1),
+    second_id: int | None = Query(default=None, ge=1),
+    completed: bool = Query(default=True),
+    hold_seconds: float = Query(default=settings.deadlock_hold_seconds, ge=0, le=5),
+    reverse_input: bool = Query(default=False),
+) -> dict[str, object]:
+    input_ids = _resolve_deadlock_ids(first_id, second_id)
+    if reverse_input:
+        input_ids = list(reversed(input_ids))
+    ordered_ids = sorted(input_ids)
+    _update_deadlock_state(last_mode="fixed_sorted")
+    payload = _lock_and_update_todos_in_order(order_ids=ordered_ids, completed=completed, hold_seconds=hold_seconds)
+    payload["input_order"] = input_ids
+    return payload
+
+
+@app.post("/deadlock/fixed/batch")
+def deadlock_fixed_batch(
+    first_id: int | None = Query(default=None, ge=1),
+    second_id: int | None = Query(default=None, ge=1),
+    completed: bool = Query(default=True),
+    reverse_input: bool = Query(default=False),
+) -> dict[str, object]:
+    todo_ids = _resolve_deadlock_ids(first_id, second_id)
+    if reverse_input:
+        todo_ids = list(reversed(todo_ids))
+    _update_deadlock_state(last_mode="fixed_batch")
+    payload = _batch_update_todos(todo_ids=todo_ids, completed=completed)
+    payload["input_order"] = todo_ids
+    return payload
 
 
 @app.get("/fk-index/status")

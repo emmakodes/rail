@@ -1208,3 +1208,86 @@ CPU_PARALLEL_JOBS=1
 CPU_THREAD_POOL_WORKERS=4
 CPU_PROCESS_POOL_WORKERS=2
 ```
+
+## Production Battlefield Scenario 20
+
+Symptom:
+
+- concurrent writes to the same rows hang until PostgreSQL detects a deadlock and kills one transaction
+
+Injection:
+
+1. Reset the known target rows:
+
+```bash
+curl -X POST "http://localhost:8000/deadlock/reset"
+```
+
+2. Inspect the target row IDs:
+
+```bash
+curl "http://localhost:8000/deadlock/status"
+```
+
+3. In two terminals, trigger the broken paths at the same time:
+
+Terminal A:
+
+```bash
+curl -X POST "http://localhost:8000/deadlock/broken/forward?hold_seconds=0.5"
+```
+
+Terminal B:
+
+```bash
+curl -X POST "http://localhost:8000/deadlock/broken/reverse?hold_seconds=0.5"
+```
+
+What to observe:
+
+- one request should eventually succeed
+- one request should return `409`
+- `/deadlock/status` should show `deadlock_count` increasing
+
+Load-test version:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e MODE=broken -e HOLD_SECONDS=0.5 -e WRITER_A_VUS=5 -e WRITER_B_VUS=5 -e DURATION=20s load-tests/todos-deadlock.js
+```
+
+What causes the deadlock:
+
+- one transaction locks row A then waits on row B
+- the other transaction locks row B then waits on row A
+- opposite lock order creates a cycle
+
+Sorted-order fix:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e MODE=sorted -e HOLD_SECONDS=0.5 -e WRITER_A_VUS=5 -e WRITER_B_VUS=5 -e DURATION=20s load-tests/todos-deadlock.js
+```
+
+What changes:
+
+- both code paths sort the todo IDs before locking
+- one request may wait, but there is no cycle
+- responses should stay `200`
+
+Single-statement batch fix:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e MODE=batch -e WRITER_A_VUS=5 -e WRITER_B_VUS=5 -e DURATION=20s load-tests/todos-deadlock.js
+```
+
+What changes:
+
+- the update is done in one `UPDATE ... WHERE id IN (...)` statement
+- PostgreSQL handles row lock acquisition internally
+- this is simpler and avoids row-by-row deadlock-prone code
+
+Useful env vars:
+
+```text
+DEADLOCK_HOLD_SECONDS=0.5
+DEADLOCK_DETECTOR_MILLISECONDS=200
+```
