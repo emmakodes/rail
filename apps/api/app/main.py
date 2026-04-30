@@ -446,6 +446,78 @@ def _lock_and_update_todos_in_order(
     }
 
 
+def _lock_sorted_todos_then_update(
+    *,
+    todo_ids: list[int],
+    completed: bool,
+    hold_seconds: float,
+) -> dict[str, object]:
+    db = SessionLocal()
+    started_at = time.perf_counter()
+    try:
+        with db.begin():
+            db.execute(
+                text(f"SET LOCAL deadlock_timeout = '{max(1, settings.deadlock_detector_milliseconds)}ms'")
+            )
+            locked_ids = db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM todos
+                    WHERE id IN :todo_ids
+                    ORDER BY id
+                    FOR UPDATE
+                    """
+                ).bindparams(bindparam("todo_ids", expanding=True)),
+                {"todo_ids": todo_ids},
+            ).scalars().all()
+            if len(locked_ids) != len(todo_ids):
+                missing_ids = sorted(set(todo_ids) - {int(todo_id) for todo_id in locked_ids})
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Todos not found: {missing_ids}",
+                )
+            if hold_seconds > 0:
+                db.execute(text("SELECT pg_sleep(:hold_seconds)"), {"hold_seconds": hold_seconds})
+            db.execute(
+                text("UPDATE todos SET completed = :completed WHERE id IN :todo_ids").bindparams(
+                    bindparam("todo_ids", expanding=True)
+                ),
+                {"completed": completed, "todo_ids": todo_ids},
+            )
+    except HTTPException:
+        raise
+    except OperationalError as exc:
+        message = str(exc).lower()
+        if "deadlock detected" in message:
+            _bump_deadlock_counters(
+                success=False,
+                error="deadlock detected",
+                order=todo_ids,
+                completed=completed,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "deadlock detected",
+                    "order": todo_ids,
+                },
+            ) from exc
+        raise
+    finally:
+        db.close()
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    _bump_deadlock_counters(success=True, error=None, order=todo_ids, completed=completed)
+    return {
+        "status": "ok",
+        "order": todo_ids,
+        "completed": completed,
+        "hold_seconds": hold_seconds,
+        "elapsed_ms": round(elapsed_ms, 2),
+    }
+
+
 def _batch_update_todos(
     *,
     todo_ids: list[int],
@@ -1242,7 +1314,7 @@ def deadlock_fixed_sorted(
         input_ids = list(reversed(input_ids))
     ordered_ids = sorted(input_ids)
     _update_deadlock_state(last_mode="fixed_sorted")
-    payload = _lock_and_update_todos_in_order(order_ids=ordered_ids, completed=completed, hold_seconds=hold_seconds)
+    payload = _lock_sorted_todos_then_update(todo_ids=ordered_ids, completed=completed, hold_seconds=hold_seconds)
     payload["input_order"] = input_ids
     return payload
 
