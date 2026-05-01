@@ -1291,3 +1291,95 @@ Useful env vars:
 DEADLOCK_HOLD_SECONDS=0.5
 DEADLOCK_DETECTOR_MILLISECONDS=200
 ```
+
+## Production Battlefield Scenario 21
+
+Symptom:
+
+- an external dependency is down, every request waits for the timeout, and the app keeps attempting calls instead of failing fast
+
+Injection:
+
+1. Reset the external breaker state:
+
+```bash
+curl -X POST "http://localhost:8000/external/circuit-breaker/reset"
+```
+
+2. Inspect the breaker:
+
+```bash
+curl "http://localhost:8000/external/circuit-breaker/status"
+```
+
+3. Call the no-breaker path against a simulated timeout:
+
+```bash
+curl -i "http://localhost:8000/external/enrichment/no-breaker?simulate=timeout"
+```
+
+What to observe:
+
+- every request waits for the full timeout
+- every request returns `504`
+- nothing learns from previous failures
+
+Circuit-breaker comparison:
+
+```bash
+curl -X POST "http://localhost:8000/external/circuit-breaker/reset"
+for _ in 1 2 3 4 5 6; do curl "http://localhost:8000/external/enrichment/circuit-breaker?simulate=timeout"; echo; done
+curl "http://localhost:8000/external/circuit-breaker/status"
+```
+
+What to observe:
+
+- the first few requests pay the timeout cost
+- once failures reach the threshold, the circuit opens
+- later requests return fast fallback payloads with `enrichment_degraded: true`
+- `blocked_requests` increases while the circuit is open
+
+Half-open recovery check:
+
+1. Wait for `EXTERNAL_CIRCUIT_OPEN_SECONDS`
+2. Probe with success:
+
+```bash
+curl "http://localhost:8000/external/enrichment/circuit-breaker?simulate=success"
+curl "http://localhost:8000/external/circuit-breaker/status"
+```
+
+What should change:
+
+- the breaker enters half-open after cooldown
+- one successful probe closes it again
+
+Load-test comparison:
+
+No breaker:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e TARGET_PATH=/external/enrichment/no-breaker -e SIMULATE=timeout -e VUS=10 -e DURATION=20s load-tests/todos-external-circuit-breaker.js
+```
+
+Circuit breaker:
+
+```bash
+curl -X POST "https://<your-api-domain>/external/circuit-breaker/reset"
+k6 run -e API_BASE_URL=https://<your-api-domain> -e TARGET_PATH=/external/enrichment/circuit-breaker -e SIMULATE=timeout -e VUS=10 -e DURATION=20s load-tests/todos-external-circuit-breaker.js
+```
+
+What should change:
+
+- no-breaker mode keeps P95 pinned near the timeout
+- breaker mode shows timeout latency only for the threshold-crossing requests
+- after the circuit opens, most responses are fast degraded fallbacks
+
+Useful env vars:
+
+```text
+EXTERNAL_TIMEOUT_SECONDS=5
+EXTERNAL_WORKER_LIMIT=5
+EXTERNAL_CIRCUIT_FAILURE_THRESHOLD=5
+EXTERNAL_CIRCUIT_OPEN_SECONDS=30
+```

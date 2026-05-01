@@ -97,6 +97,30 @@ DB_CIRCUIT_BREAKER = SimpleCircuitBreaker()
 
 
 @dataclass
+class ExternalCircuitBreakerState:
+    failure_count: int = 0
+    opened_until: float = 0
+    blocked_requests: int = 0
+    successful_calls: int = 0
+    failed_calls: int = 0
+    probe_in_flight: bool = False
+    last_error: str | None = None
+
+    @property
+    def state(self) -> str:
+        now = time.time()
+        if self.opened_until > now:
+            return "open"
+        if self.opened_until > 0 and self.failure_count >= settings.external_circuit_failure_threshold:
+            return "half_open"
+        return "closed"
+
+
+EXTERNAL_CIRCUIT_BREAKER = ExternalCircuitBreakerState()
+EXTERNAL_CIRCUIT_BREAKER_LOCK = threading.Lock()
+
+
+@dataclass
 class MigrationDrillState:
     running: bool = False
     mode: str = "idle"
@@ -1500,6 +1524,89 @@ def _db_retry_status_payload() -> dict[str, float | int | str]:
     }
 
 
+def _external_breaker_status_payload() -> dict[str, float | int | str | bool | None]:
+    with EXTERNAL_CIRCUIT_BREAKER_LOCK:
+        return {
+            "failure_count": EXTERNAL_CIRCUIT_BREAKER.failure_count,
+            "state": EXTERNAL_CIRCUIT_BREAKER.state,
+            "opened_until_epoch": round(EXTERNAL_CIRCUIT_BREAKER.opened_until, 2),
+            "blocked_requests": EXTERNAL_CIRCUIT_BREAKER.blocked_requests,
+            "successful_calls": EXTERNAL_CIRCUIT_BREAKER.successful_calls,
+            "failed_calls": EXTERNAL_CIRCUIT_BREAKER.failed_calls,
+            "probe_in_flight": EXTERNAL_CIRCUIT_BREAKER.probe_in_flight,
+            "last_error": EXTERNAL_CIRCUIT_BREAKER.last_error,
+        }
+
+
+def _reset_external_breaker() -> None:
+    with EXTERNAL_CIRCUIT_BREAKER_LOCK:
+        EXTERNAL_CIRCUIT_BREAKER.failure_count = 0
+        EXTERNAL_CIRCUIT_BREAKER.opened_until = 0
+        EXTERNAL_CIRCUIT_BREAKER.blocked_requests = 0
+        EXTERNAL_CIRCUIT_BREAKER.successful_calls = 0
+        EXTERNAL_CIRCUIT_BREAKER.failed_calls = 0
+        EXTERNAL_CIRCUIT_BREAKER.probe_in_flight = False
+        EXTERNAL_CIRCUIT_BREAKER.last_error = None
+
+
+def _external_breaker_begin_request() -> tuple[bool, str]:
+    with EXTERNAL_CIRCUIT_BREAKER_LOCK:
+        state = EXTERNAL_CIRCUIT_BREAKER.state
+        if state == "open":
+            EXTERNAL_CIRCUIT_BREAKER.blocked_requests += 1
+            return False, "open"
+        if state == "half_open":
+            if EXTERNAL_CIRCUIT_BREAKER.probe_in_flight:
+                EXTERNAL_CIRCUIT_BREAKER.blocked_requests += 1
+                return False, "half_open"
+            EXTERNAL_CIRCUIT_BREAKER.probe_in_flight = True
+            return True, "half_open"
+        return True, "closed"
+
+
+def _external_breaker_record_success() -> None:
+    with EXTERNAL_CIRCUIT_BREAKER_LOCK:
+        EXTERNAL_CIRCUIT_BREAKER.failure_count = 0
+        EXTERNAL_CIRCUIT_BREAKER.opened_until = 0
+        EXTERNAL_CIRCUIT_BREAKER.successful_calls += 1
+        EXTERNAL_CIRCUIT_BREAKER.probe_in_flight = False
+        EXTERNAL_CIRCUIT_BREAKER.last_error = None
+
+
+def _external_breaker_record_failure(error: str) -> None:
+    with EXTERNAL_CIRCUIT_BREAKER_LOCK:
+        EXTERNAL_CIRCUIT_BREAKER.failed_calls += 1
+        EXTERNAL_CIRCUIT_BREAKER.failure_count += 1
+        EXTERNAL_CIRCUIT_BREAKER.probe_in_flight = False
+        EXTERNAL_CIRCUIT_BREAKER.last_error = error
+        if EXTERNAL_CIRCUIT_BREAKER.failure_count >= settings.external_circuit_failure_threshold:
+            EXTERNAL_CIRCUIT_BREAKER.opened_until = time.time() + settings.external_circuit_open_seconds
+
+
+async def _call_external_dependency(simulate: str) -> dict[str, str | float]:
+    async with EXTERNAL_CALL_SEMAPHORE:
+        if simulate == "timeout":
+            await asyncio.sleep(settings.external_timeout_seconds)
+            raise httpx.TimeoutException("Simulated external timeout")
+        if simulate == "success":
+            await asyncio.sleep(0.05)
+            return {"provider_status": "ok", "simulate": simulate}
+
+        async with httpx.AsyncClient(timeout=settings.external_timeout_seconds) as client:
+            response = await client.get(settings.external_hang_url)
+            response.raise_for_status()
+        return {"provider_status": "ok", "simulate": simulate}
+
+
+def _external_fallback_payload(reason: str) -> dict[str, object]:
+    return {
+        "status": "degraded",
+        "enrichment_degraded": True,
+        "fallback_reason": reason,
+        **_external_breaker_status_payload(),
+    }
+
+
 def _run_artificially_slow_db(
     request: Request,
     db: Session,
@@ -1658,6 +1765,83 @@ async def external_timeout() -> dict[str, str | float]:
                 detail="External call timed out",
             ) from exc
         return {"status": "ok", "timeout_seconds": settings.external_timeout_seconds}
+
+
+@app.get("/external/circuit-breaker/status")
+def external_circuit_breaker_status() -> dict[str, float | int | str | bool | None]:
+    return _external_breaker_status_payload()
+
+
+@app.post("/external/circuit-breaker/reset")
+def external_circuit_breaker_reset() -> dict[str, float | int | str | bool | None]:
+    _reset_external_breaker()
+    return _external_breaker_status_payload()
+
+
+@app.get("/external/enrichment/no-breaker")
+async def external_enrichment_no_breaker(
+    simulate: str = Query(default="timeout", pattern="^(timeout|success|real)$"),
+) -> dict[str, object]:
+    try:
+        upstream_payload = await _call_external_dependency(simulate)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="External enrichment timed out without a circuit breaker",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="External enrichment failed without a circuit breaker",
+        ) from exc
+
+    return {
+        "status": "ok",
+        "enrichment_degraded": False,
+        "source": "external",
+        "simulate": simulate,
+        **upstream_payload,
+    }
+
+
+@app.get("/external/enrichment/circuit-breaker")
+async def external_enrichment_circuit_breaker(
+    simulate: str = Query(default="timeout", pattern="^(timeout|success|real)$"),
+) -> dict[str, object]:
+    allow_request, breaker_state = _external_breaker_begin_request()
+    if not allow_request:
+        return _external_fallback_payload(f"circuit_{breaker_state}")
+
+    try:
+        upstream_payload = await _call_external_dependency(simulate)
+    except httpx.TimeoutException:
+        _external_breaker_record_failure("timeout")
+        current_state = _external_breaker_status_payload()["state"]
+        if current_state == "open":
+            return _external_fallback_payload("timeout_opened_circuit")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="External enrichment timed out before the circuit opened",
+        )
+    except httpx.HTTPError:
+        _external_breaker_record_failure("http_error")
+        current_state = _external_breaker_status_payload()["state"]
+        if current_state == "open":
+            return _external_fallback_payload("http_error_opened_circuit")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="External enrichment failed before the circuit opened",
+        )
+
+    _external_breaker_record_success()
+    return {
+        "status": "ok",
+        "enrichment_degraded": False,
+        "source": "external",
+        "simulate": simulate,
+        **upstream_payload,
+        **_external_breaker_status_payload(),
+    }
 
 
 def _memory_stats() -> dict[str, int | float]:

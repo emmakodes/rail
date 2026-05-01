@@ -21,6 +21,8 @@ class Settings:
     external_hang_url = os.getenv("EXTERNAL_HANG_URL", "https://httpbin.org/delay/30")
     external_timeout_seconds = float(os.getenv("EXTERNAL_TIMEOUT_SECONDS", "3"))
     external_worker_limit = int(os.getenv("EXTERNAL_WORKER_LIMIT", "5"))
+    external_circuit_failure_threshold = int(os.getenv("EXTERNAL_CIRCUIT_FAILURE_THRESHOLD", "5"))
+    external_circuit_open_seconds = float(os.getenv("EXTERNAL_CIRCUIT_OPEN_SECONDS", "30"))
     retry_storm_attempts = int(os.getenv("RETRY_STORM_ATTEMPTS", "5"))
     retry_backoff_base_seconds = float(os.getenv("RETRY_BACKOFF_BASE_SECONDS", "0.2"))
     circuit_breaker_failure_threshold = int(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
