@@ -45,6 +45,10 @@ class Settings:
     cpu_process_pool_workers = int(os.getenv("CPU_PROCESS_POOL_WORKERS", "2"))
     deadlock_hold_seconds = float(os.getenv("DEADLOCK_HOLD_SECONDS", "0.5"))
     deadlock_detector_milliseconds = int(os.getenv("DEADLOCK_DETECTOR_MILLISECONDS", "200"))
+    background_job_delay_seconds = float(os.getenv("BACKGROUND_JOB_DELAY_SECONDS", "0.5"))
+    background_queue_workers = int(os.getenv("BACKGROUND_QUEUE_WORKERS", "1"))
+    background_queue_maxsize = int(os.getenv("BACKGROUND_QUEUE_MAXSIZE", "500"))
+    background_job_payload_bytes = int(os.getenv("BACKGROUND_JOB_PAYLOAD_BYTES", "4096"))
     railway_replicas = int(os.getenv("RAILWAY_REPLICAS", "1"))
     db_connection_budget = int(os.getenv("DB_CONNECTION_BUDGET", "25"))
     auto_tune_db_pool_for_replicas = os.getenv("AUTO_TUNE_DB_POOL_FOR_REPLICAS", "false").lower() == "true"

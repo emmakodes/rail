@@ -1383,3 +1383,89 @@ EXTERNAL_WORKER_LIMIT=5
 EXTERNAL_CIRCUIT_FAILURE_THRESHOLD=5
 EXTERNAL_CIRCUIT_OPEN_SECONDS=30
 ```
+
+## Production Battlefield Scenario 25
+
+Symptom:
+
+- `POST /todos` pushes background jobs into an in-process queue faster than workers can drain them
+- with an unbounded queue, memory keeps growing until the process is eventually OOM-killed
+
+Injection:
+
+1. Keep the queue deliberately slower than the producer:
+
+```text
+BACKGROUND_JOB_DELAY_SECONDS=0.5
+BACKGROUND_QUEUE_WORKERS=1
+BACKGROUND_QUEUE_MAXSIZE=500
+BACKGROUND_JOB_PAYLOAD_BYTES=4096
+```
+
+2. Reset the queue drill:
+
+```bash
+curl -X POST "http://localhost:8000/queue-overload/reset"
+```
+
+3. Inspect queue status:
+
+```bash
+curl "http://localhost:8000/queue-overload/status"
+```
+
+4. Hammer `POST /todos` with the unbounded queue:
+
+```bash
+k6 run -e API_BASE_URL=https://<your-api-domain> -e BACKGROUND_MODE=unbounded -e RATE=500 -e DURATION=20s -e PREALLOCATED_VUS=50 -e MAX_VUS=200 load-tests/todos-queue-overload.js
+```
+
+5. Inspect status again:
+
+```bash
+curl "http://localhost:8000/queue-overload/status"
+```
+
+What to observe:
+
+- `queues.unbounded.queue_size` climbs rapidly
+- `estimated_queue_mb` climbs with it
+- requests still return `201`, so producers never feel pressure
+- the queue accepts more work than the workers can process
+
+Bounded comparison:
+
+```bash
+curl -X POST "http://localhost:8000/queue-overload/reset"
+k6 run -e API_BASE_URL=https://<your-api-domain> -e BACKGROUND_MODE=bounded -e RATE=500 -e DURATION=20s -e PREALLOCATED_VUS=50 -e MAX_VUS=200 load-tests/todos-queue-overload.js
+curl "http://localhost:8000/queue-overload/status"
+```
+
+What should change:
+
+- `queues.bounded.queue_size` caps near `BACKGROUND_QUEUE_MAXSIZE`
+- `queues.bounded.shed_count` starts increasing
+- memory stays much flatter than the unbounded run
+- request responses include `x-background-job-status: shed` once the queue is full
+
+What this drill teaches:
+
+- `asyncio.Queue(maxsize=0)` is unbounded, not zero-sized
+- a queue full of valid jobs is still a memory problem if producers outrun consumers
+- backpressure means making overload explicit: bound the queue and shed or reject work
+
+Useful endpoints:
+
+```bash
+curl "http://localhost:8000/queue-overload/status"
+curl -X POST "http://localhost:8000/queue-overload/reset"
+```
+
+Useful env vars:
+
+```text
+BACKGROUND_JOB_DELAY_SECONDS=0.5
+BACKGROUND_QUEUE_WORKERS=1
+BACKGROUND_QUEUE_MAXSIZE=500
+BACKGROUND_JOB_PAYLOAD_BYTES=4096
+```

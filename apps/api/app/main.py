@@ -7,6 +7,7 @@ import threading
 import time
 import tracemalloc
 from collections import deque
+from contextlib import suppress
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -173,6 +174,25 @@ class DeadlockDrillState:
 DEADLOCK_DRILL_STATE = DeadlockDrillState()
 DEADLOCK_DRILL_STATE_LOCK = threading.Lock()
 
+
+@dataclass
+class BackgroundQueueDrill:
+    name: str
+    queue: asyncio.Queue[dict[str, object]]
+    maxsize: int
+    generation: int = 0
+    accepted_count: int = 0
+    processed_count: int = 0
+    shed_count: int = 0
+    inflight_count: int = 0
+    last_status: str = "idle"
+    last_error: str | None = None
+
+
+BACKGROUND_QUEUE_STATE_LOCK = threading.Lock()
+BACKGROUND_QUEUE_DRILLS: dict[str, BackgroundQueueDrill] = {}
+BACKGROUND_QUEUE_WORKER_TASKS: list[asyncio.Task] = []
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.parsed_cors_origins,
@@ -182,6 +202,153 @@ app.add_middleware(
 )
 
 
+def _initialize_background_queue_drills() -> None:
+    global BACKGROUND_QUEUE_DRILLS, BACKGROUND_QUEUE_WORKER_TASKS
+    if BACKGROUND_QUEUE_DRILLS:
+        return
+
+    BACKGROUND_QUEUE_DRILLS = {
+        "unbounded": BackgroundQueueDrill(
+            name="unbounded",
+            queue=asyncio.Queue(maxsize=0),
+            maxsize=0,
+        ),
+        "bounded": BackgroundQueueDrill(
+            name="bounded",
+            queue=asyncio.Queue(maxsize=settings.background_queue_maxsize),
+            maxsize=settings.background_queue_maxsize,
+        ),
+    }
+    BACKGROUND_QUEUE_WORKER_TASKS = []
+    for drill_name in BACKGROUND_QUEUE_DRILLS:
+        for worker_index in range(settings.background_queue_workers):
+            BACKGROUND_QUEUE_WORKER_TASKS.append(
+                asyncio.create_task(
+                    _background_queue_worker(drill_name, worker_index),
+                    name=f"{drill_name}-queue-worker-{worker_index}",
+                )
+            )
+
+
+async def _background_queue_worker(drill_name: str, worker_index: int) -> None:
+    drill = BACKGROUND_QUEUE_DRILLS[drill_name]
+    while True:
+        job = await drill.queue.get()
+        job_generation = int(job["generation"])
+        try:
+            with BACKGROUND_QUEUE_STATE_LOCK:
+                if job_generation == drill.generation:
+                    drill.inflight_count += 1
+                    drill.last_status = "processing"
+            await asyncio.sleep(settings.background_job_delay_seconds)
+            with BACKGROUND_QUEUE_STATE_LOCK:
+                if job_generation == drill.generation:
+                    drill.processed_count += 1
+                    drill.last_status = "processed"
+                    if drill.inflight_count > 0:
+                        drill.inflight_count -= 1
+        except asyncio.CancelledError:
+            with BACKGROUND_QUEUE_STATE_LOCK:
+                if job_generation == drill.generation and drill.inflight_count > 0:
+                    drill.inflight_count -= 1
+                    drill.last_status = "cancelled"
+            raise
+        except Exception as exc:
+            with BACKGROUND_QUEUE_STATE_LOCK:
+                if job_generation == drill.generation:
+                    drill.last_error = str(exc)
+                    drill.last_status = "worker_error"
+                    if drill.inflight_count > 0:
+                        drill.inflight_count -= 1
+            logger.exception(
+                "background queue worker failed",
+                extra={
+                    "event": "background_queue_worker_error",
+                    "extra_fields": {
+                        "queue_mode": drill_name,
+                        "worker_index": worker_index,
+                    },
+                },
+            )
+        finally:
+            drill.queue.task_done()
+
+
+def _background_queue_status_payload() -> dict[str, object]:
+    queues: dict[str, object] = {}
+    with BACKGROUND_QUEUE_STATE_LOCK:
+        for drill_name, drill in BACKGROUND_QUEUE_DRILLS.items():
+            queued_items = drill.queue.qsize()
+            estimated_bytes = (queued_items + drill.inflight_count) * settings.background_job_payload_bytes
+            queues[drill_name] = {
+                "queue_size": queued_items,
+                "maxsize": drill.maxsize,
+                "accepted_count": drill.accepted_count,
+                "processed_count": drill.processed_count,
+                "shed_count": drill.shed_count,
+                "inflight_count": drill.inflight_count,
+                "generation": drill.generation,
+                "last_status": drill.last_status,
+                "last_error": drill.last_error,
+                "estimated_queue_bytes": estimated_bytes,
+                "estimated_queue_mb": round(estimated_bytes / (1024 * 1024), 2),
+            }
+    sustainable_rps = (
+        round(settings.background_queue_workers / settings.background_job_delay_seconds, 2)
+        if settings.background_job_delay_seconds > 0
+        else None
+    )
+    rss_bytes = process.memory_info().rss
+    return {
+        "worker_count": settings.background_queue_workers,
+        "job_delay_seconds": settings.background_job_delay_seconds,
+        "job_payload_bytes": settings.background_job_payload_bytes,
+        "sustainable_jobs_per_second": sustainable_rps,
+        "rss_bytes": rss_bytes,
+        "rss_mb": round(rss_bytes / (1024 * 1024), 2),
+        "queues": queues,
+    }
+
+
+def _reset_background_queue_drills() -> dict[str, object]:
+    with BACKGROUND_QUEUE_STATE_LOCK:
+        for drill in BACKGROUND_QUEUE_DRILLS.values():
+            drill.generation += 1
+            drill.accepted_count = 0
+            drill.processed_count = 0
+            drill.shed_count = 0
+            drill.inflight_count = 0
+            drill.last_status = "reset"
+            drill.last_error = None
+            while True:
+                try:
+                    drill.queue.get_nowait()
+                    drill.queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+    return _background_queue_status_payload()
+
+
+def _enqueue_background_todo_job(*, mode: str, todo: Todo) -> str:
+    drill = BACKGROUND_QUEUE_DRILLS[mode]
+    with BACKGROUND_QUEUE_STATE_LOCK:
+        job = {
+            "generation": drill.generation,
+            "todo_id": todo.id,
+            "title": todo.title,
+            "payload_blob": "x" * settings.background_job_payload_bytes,
+        }
+        try:
+            drill.queue.put_nowait(job)
+        except asyncio.QueueFull:
+            drill.shed_count += 1
+            drill.last_status = "shed"
+            return "shed"
+        drill.accepted_count += 1
+        drill.last_status = "enqueued"
+    return "enqueued"
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     initialize_database()
@@ -189,6 +356,7 @@ async def on_startup() -> None:
     global MEMORY_BASELINE_SNAPSHOT
     MEMORY_BASELINE_SNAPSHOT = tracemalloc.take_snapshot()
     asyncio.create_task(monitor_event_loop_lag())
+    _initialize_background_queue_drills()
     _update_startup_warm_state(
         mode=settings.startup_warm_mode,
         stage="disabled" if settings.startup_warm_mode == "disabled" else "startup_pending",
@@ -218,7 +386,14 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    global CPU_THREAD_POOL, CPU_PROCESS_POOL
+    global CPU_THREAD_POOL, CPU_PROCESS_POOL, BACKGROUND_QUEUE_WORKER_TASKS, BACKGROUND_QUEUE_DRILLS
+    for task in BACKGROUND_QUEUE_WORKER_TASKS:
+        task.cancel()
+    for task in BACKGROUND_QUEUE_WORKER_TASKS:
+        with suppress(asyncio.CancelledError):
+            await task
+    BACKGROUND_QUEUE_WORKER_TASKS = []
+    BACKGROUND_QUEUE_DRILLS = {}
     if CPU_THREAD_POOL is not None:
         CPU_THREAD_POOL.shutdown(wait=False, cancel_futures=True)
         CPU_THREAD_POOL = None
@@ -1767,6 +1942,16 @@ async def external_timeout() -> dict[str, str | float]:
         return {"status": "ok", "timeout_seconds": settings.external_timeout_seconds}
 
 
+@app.get("/queue-overload/status")
+def queue_overload_status() -> dict[str, object]:
+    return _background_queue_status_payload()
+
+
+@app.post("/queue-overload/reset")
+def queue_overload_reset() -> dict[str, object]:
+    return _reset_background_queue_drills()
+
+
 @app.get("/external/circuit-breaker/status")
 def external_circuit_breaker_status() -> dict[str, float | int | str | bool | None]:
     return _external_breaker_status_payload()
@@ -2427,7 +2612,13 @@ def explain_todos_query(
 
 
 @app.post("/todos", response_model=TodoRead, status_code=status.HTTP_201_CREATED)
-def create_todo(request: Request, payload: TodoCreate, db: Session = Depends(get_db)) -> Todo:
+def create_todo(
+    request: Request,
+    response: Response,
+    payload: TodoCreate,
+    background_mode: str = Query(default="off", pattern="^(off|unbounded|bounded)$"),
+    db: Session = Depends(get_db),
+) -> Todo:
     rate_limit = check_todo_create_rate_limit(request)
     if rate_limit is not None:
         request.state.rate_limit_limit = rate_limit.limit
@@ -2458,6 +2649,11 @@ def create_todo(request: Request, payload: TodoCreate, db: Session = Depends(get
     db.commit()
     db.refresh(todo)
     invalidate_todo_list_cache()
+    background_job_status = "disabled"
+    if background_mode != "off":
+        background_job_status = _enqueue_background_todo_job(mode=background_mode, todo=todo)
+    response.headers["x-background-job-status"] = background_job_status
+    response.headers["x-background-job-mode"] = background_mode
     logger.info(
         "todo created",
         extra={
@@ -2465,6 +2661,8 @@ def create_todo(request: Request, payload: TodoCreate, db: Session = Depends(get
             "extra_fields": {
                 "todo_id": todo.id,
                 "title_length": len(todo.title),
+                "background_mode": background_mode,
+                "background_job_status": background_job_status,
             },
         },
     )
